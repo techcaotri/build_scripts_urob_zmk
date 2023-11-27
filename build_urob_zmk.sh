@@ -33,10 +33,14 @@ compile_firmware() {
 	info "CONFIG_DIR: $CONFIG_DIR"
 	ZMK_DIR="$SOURCE_DIR/zmk"
 	info "ZMK_DIR: $ZMK_DIR"
+	ZEPHYR_DIR="$SOURCE_DIR/zephyr"
+	info "ZEPHYR_DIR: $ZEPHYR_DIR"
+  zephyr_version=$(awk -F ' *= *' '/VERSION_MAJOR/ {major=$2} /VERSION_MINOR/ {minor=$2} /PATCHLEVEL/ {patch=$2} END {printf "%d%d%d", major, minor, patch}' "$ZEPHYR_DIR/VERSION")
+  info "zephyr_version: $zephyr_version"
 
 	force_flag=""
 	if [ $2 = true ]; then
-		force_flag="-- -p"
+      force_flag="-- -p"
 	fi
 	echo "force_flag: $force_flag"
 	output_dir="$SCRIPT_DIR/sofle_output_uf2"

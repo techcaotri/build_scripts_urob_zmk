@@ -91,6 +91,40 @@ install_west() {
 prepare_adv360_pro() {
 	info "Preparing environment for Advantage360 Pro"
 	# Add specific steps for Advantage360 Pro
+
+	info "Checking source from-urob-zmk-config file exist..."
+	if [ ! -d from-urob-zmk-config ]; then
+    info "Cloning source from-urob-zmk-config directory for Advantage360 Pro"
+		git clone --recurse-submodules -j8 -b tripham_adv360_pro git@github.com:techcaotri/from-urob-zmk-config.git
+	fi
+
+	info "Checking config file exist..."
+	if [ ! -f config/west.yml ]; then
+    info "Create soft link for config west.yml file..."
+		mkdir -p config && cd config
+    ln -sf "$(pwd)/../from-urob-zmk-config/config/west.yml" .
+		cd ..
+	fi
+
+  info "Checking build.yml file exist..."
+	if [ ! -f build.yaml ]; then
+    info "Create soft link for build.yaml file exist..."
+    ln -sf from-urob-zmk-config/build.yaml .
+  fi
+
+	info "Checking zmk directory exist..."
+  if [ ! -d zmk ]; then
+    info "Initializing folders according to current config..."
+    west init -l config
+    info "Updating source folders..."
+    west update
+  fi
+
+  info "Exporting CMake build environment variables..."
+  west zephyr-export
+
+  info "Installing Python requirements..."
+  pip install -r zephyr/scripts/requirements.txt
 }
 
 prepare_sofle_v2() {
