@@ -59,6 +59,7 @@ check_python_venv() {
 			exit 1
 		fi
 		info "Virtual environment created at '.venv/'"
+		source .venv/bin/activate
 	else
 		info "Running inside a Python virtual environment."
 	fi
@@ -109,7 +110,7 @@ prepare_sofle_nicenano_v2() {
 
   info "Checking new keypos_def header file exist..."
 	if [ ! -f from-urob-zmk-config/zmk-nodefree-config/keypos_def/keypos_60keys.h ]; then
-    info "Create soft link for new keypos_def header file ..."
+    info "Create soft link for config west.yml file..."
     pushd .
     cd from-urob-zmk-config/zmk-nodefree-config/keypos_def
     ln -sf ../../keypos_def/keypos_60keys.h .

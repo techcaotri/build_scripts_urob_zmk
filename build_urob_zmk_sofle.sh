@@ -20,20 +20,19 @@ LIGHTPURPLE='\033[1;35m'
 LIGHTCYAN='\033[1;36m'
 WHITE='\033[1;37m'
 
-
 info() {
 	echo -e "${GREEN}$@${NOCOLOR}"
 }
 
 compile_firmware() {
-  SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-  info "SCRIPT_DIR: $SCRIPT_DIR"
-  SOURCE_DIR=$(realpath "$1")
-  info "SOURCE_DIR: $SOURCE_DIR"
-  CONFIG_DIR="$1/from-urob-zmk-config"
-  info "CONFIG_DIR: $CONFIG_DIR"
-  ZMK_DIR="$SOURCE_DIR/zmk"
-  info "ZMK_DIR: $ZMK_DIR"
+	SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+	info "SCRIPT_DIR: $SCRIPT_DIR"
+	SOURCE_DIR=$(realpath "$1")
+	info "SOURCE_DIR: $SOURCE_DIR"
+	CONFIG_DIR="$(realpath "$1")/from-urob-zmk-config"
+	info "CONFIG_DIR: $CONFIG_DIR"
+	ZMK_DIR="$SOURCE_DIR/zmk"
+	info "ZMK_DIR: $ZMK_DIR"
 
 	force_flag=""
 	if [ $2 = true ]; then
@@ -42,9 +41,9 @@ compile_firmware() {
 	echo "force_flag: $force_flag"
 	output_dir="$SCRIPT_DIR/sofle_output_uf2"
 	mkdir -p "$output_dir"
-  OPTIONS=" -l -o "$output_dir" --host-config-dir "$CONFIG_DIR" --host-zmk-dir "$ZMK_DIR" $force_flag"
-  echo "$CONFIG_DIR"/scripts/zmk_build.sh "$OPTIONS"
-  "$CONFIG_DIR"/scripts/zmk_build.sh $OPTIONS
+	OPTIONS=" -l -o "$output_dir" --host-config-dir "$CONFIG_DIR" --host-zmk-dir "$ZMK_DIR" $force_flag"
+	echo "$CONFIG_DIR"/scripts/zmk_build.sh "$OPTIONS"
+	"$CONFIG_DIR"/scripts/zmk_build.sh $OPTIONS
 }
 
 usage() {
@@ -62,6 +61,7 @@ while [[ $# -gt 0 ]]; do
 	case "$1" in
 	-h | --help)
 		usage
+		exit 0
 		;;
 	-p | --path)
 		path="$2"
@@ -70,12 +70,13 @@ while [[ $# -gt 0 ]]; do
 		;;
 	-f | --force)
 		force=true
+		shift
 		;;
 	*)
 		usage
+		exit 1
 		;;
 	esac
-	shift
 done
 
 if [[ -z "$path" ]]; then
@@ -85,7 +86,21 @@ fi
 
 pushd .
 cd "$path" || exit
+if [ -d .venv ]; then
+	source .venv/bin/activate
+  if [[ -z "$VIRTUAL_ENV" ]]; then
+		error "Python virtual environment not detected."
+    exit 1
+	else
+		info "Running inside a Python virtual environment."
+	fi
+else
+  error "No .venv directory found. Please run prepare_zmk_build_environment.sh first."
+  exit 1
+fi
+
 info "Export Zephyr CMake package..."
 west zephyr-export
 popd || exit
+echo "force: $force"
 compile_firmware "$path" $force
