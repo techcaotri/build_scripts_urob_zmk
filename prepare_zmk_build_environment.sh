@@ -130,6 +130,49 @@ prepare_adv360_pro() {
 prepare_sofle_v2() {
 	info "Preparing environment for Sofle v2"
 	# Add specific steps for Sofle v2
+
+	info "Checking source from-urob-zmk-config file exist..."
+	if [ ! -d from-urob-zmk-config ]; then
+    info "Cloning source from-urob-zmk-config directory for Sofle v2"
+		git clone --recurse-submodules -j8 -b tripham_sofle git@github.com:techcaotri/from-urob-zmk-config.git
+	fi
+
+  info "Checking new keypos_def header file exist..."
+	if [ ! -f from-urob-zmk-config/zmk-nodefree-config/keypos_def/keypos_60keys.h ]; then
+    info "Create soft link for config west.yml file..."
+    pushd .
+    cd from-urob-zmk-config/zmk-nodefree-config/keypos_def
+    ln -sf ../../keypos_def/keypos_60keys.h .
+    popd
+	fi
+
+	info "Checking config file exist..."
+	if [ ! -f config/west.yml ]; then
+    info "Create soft link for config west.yml file..."
+		mkdir -p config && cd config
+    ln -sf "$(pwd)/../from-urob-zmk-config/config/west.yml" .
+		cd ..
+	fi
+
+  info "Checking build.yml file exist..."
+	if [ ! -f build.yaml ]; then
+    info "Create soft link for build.yaml file exist..."
+    ln -sf from-urob-zmk-config/build.yaml .
+  fi
+
+	info "Checking zmk directory exist..."
+  if [ ! -d zmk ]; then
+    info "Initializing folders according to current config..."
+    west init -l config
+    info "Updating source folders..."
+    west update
+  fi
+
+  info "Exporting CMake build environment variables..."
+  west zephyr-export
+
+  info "Installing Python requirements..."
+  pip install -r zephyr/scripts/requirements.txt
 }
 
 prepare_sofle_nicenano_v2() {
