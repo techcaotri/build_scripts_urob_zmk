@@ -20,49 +20,40 @@ LIGHTPURPLE='\033[1;35m'
 LIGHTCYAN='\033[1;36m'
 WHITE='\033[1;37m'
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-SOURCE_DIR="$SCRIPT_DIR/../source_urob_zmk_sofle"
-CONFIG_DIR="$SCRIPT_DIR/../from-urob-zmk-config"
-ZMK_DIR="$SOURCE_DIR/zmk"
 
-init_build_environment() {
-	echo -e "${LIGHTBLUE}Initialize the Sofle 'sofle' build environment...${NOCOLOR}"
-	source ../.venv/bin/activate
-	cp -i "$CONFIG_DIR/config/west.yml.sofle" "$CONFIG_DIR/config/west.yml"
-
-	echo -e "${LIGHTBLUE}Initialize application to CONFIG_DIR's 'config' dir...${NOCOLOR}"
-	cd "$SOURCE_DIR" || exit
-	west init -l config
-
-	echo -e "${LIGHTBLUE}Update to Fetch Modules ...${NOCOLOR}"
-	west update
-	echo -e "${LIGHTBLUE}Export Zephyr CMake package...${NOCOLOR}"
-	west zephyr-export
-	echo -e "${LIGHTBLUE}Install Zephyr Python Dependencies...${NOCOLOR}"
-	pip install -r zephyr/scripts/requirements.txt
+info() {
+	echo -e "${GREEN}$@${NOCOLOR}"
 }
 
 compile_firmware() {
+  SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+  info "SCRIPT_DIR: $SCRIPT_DIR"
+  SOURCE_DIR=$(realpath "$1")
+  info "SOURCE_DIR: $SOURCE_DIR"
+  CONFIG_DIR="$1/from-urob-zmk-config"
+  info "CONFIG_DIR: $CONFIG_DIR"
+  ZMK_DIR="$SOURCE_DIR/zmk"
+  info "ZMK_DIR: $ZMK_DIR"
+
 	force_flag=""
-	if [ $1 = true ]; then
-		force_flag="-p"
+	if [ $2 = true ]; then
+		force_flag="-- -p"
 	fi
 	echo "force_flag: $force_flag"
 	output_dir="$SCRIPT_DIR/sofle_output_uf2"
 	mkdir -p "$output_dir"
-	$CONFIG_DIR/scripts/zmk_build.sh -l -o "$output_dir" \
-		--host-config-dir "$CONFIG_DIR" \
-		--host-zmk-dir "$ZMK_DIR" -- $force_flag 
+  OPTIONS=" -l -o "$output_dir" --host-config-dir "$CONFIG_DIR" --host-zmk-dir "$ZMK_DIR" $force_flag"
+  echo "$CONFIG_DIR"/scripts/zmk_build.sh "$OPTIONS"
+  "$CONFIG_DIR"/scripts/zmk_build.sh $OPTIONS
 }
 
 usage() {
-	echo "Usage: $0 [-h|--help] [-i|--init] [-f|--force]"
+	echo -e ${CYAN} "Usage: $0 [-h|--help] [-p --path path] [-f|--force]"${NOCOLOR}
 	echo
-	echo "Argmuments:"
-	echo "  -h, --help    Display this help message"
-	echo "  -i, --init    Init the build environment"
-	echo "  -f, --force   Force rebuild"
-	echo "The default (no argument) will compile the firmware"
+	echo -e ${CYAN} "Argmuments:"${NOCOLOR}
+	echo -e ${CYAN} "  -h, --help    Display this help message"${NOCOLOR}
+	echo -e ${CYAN} "  -f, --force   Force rebuild"${NOCOLOR}
+	echo -e ${CYAN} "The default (no argument) will compile the firmware"${NOCOLOR}
 	exit 1
 }
 
@@ -72,8 +63,10 @@ while [[ $# -gt 0 ]]; do
 	-h | --help)
 		usage
 		;;
-	-u | --update)
-		init_build_environment
+	-p | --path)
+		path="$2"
+		shift # past argument
+		shift # past value
 		;;
 	-f | --force)
 		force=true
@@ -85,9 +78,14 @@ while [[ $# -gt 0 ]]; do
 	shift
 done
 
+if [[ -z "$path" ]]; then
+	error "No path specified. Use -p or --path to specify a path."
+	exit 1
+fi
+
 pushd .
-cd "$SOURCE_DIR" || exit
-echo -e "${LIGHTBLUE}Export Zephyr CMake package...${NOCOLOR}"
+cd "$path" || exit
+info "Export Zephyr CMake package..."
 west zephyr-export
 popd || exit
-compile_firmware $force
+compile_firmware "$path" $force

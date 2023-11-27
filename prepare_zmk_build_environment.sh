@@ -104,7 +104,16 @@ prepare_sofle_nicenano_v2() {
 	info "Checking source from-urob-zmk-config file exist..."
 	if [ ! -d from-urob-zmk-config ]; then
     info "Cloning source from-urob-zmk-config directory for Sofle nicenano v2 choc"
-		git clone -b tripham_choc_nicenanov2_sofle git@github.com:techcaotri/from-urob-zmk-config.git
+		git clone --recurse-submodules -j8 -b tripham_choc_nicenanov2_sofle git@github.com:techcaotri/from-urob-zmk-config.git
+	fi
+
+  info "Checking new keypos_def header file exist..."
+	if [ ! -f from-urob-zmk-config/zmk-nodefree-config/keypos_def/keypos_60keys.h ]; then
+    info "Create soft link for new keypos_def header file ..."
+    pushd .
+    cd from-urob-zmk-config/zmk-nodefree-config/keypos_def
+    ln -sf ../../keypos_def/keypos_60keys.h .
+    popd
 	fi
 
 	info "Checking config file exist..."
