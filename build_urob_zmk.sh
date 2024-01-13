@@ -43,7 +43,7 @@ compile_firmware() {
       force_flag="-- -p"
 	fi
 	echo "force_flag: $force_flag"
-	output_dir="$SCRIPT_DIR/sofle_output_uf2"
+	output_dir="$SCRIPT_DIR/output_uf2"
 	mkdir -p "$output_dir"
 	OPTIONS=" -l -o "$output_dir" --host-config-dir "$CONFIG_DIR" --host-zmk-dir "$ZMK_DIR" $force_flag"
 	echo "$CONFIG_DIR"/scripts/zmk_build.sh "$OPTIONS"
