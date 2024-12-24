@@ -55,6 +55,7 @@ usage() {
 	echo
 	echo -e ${CYAN} "Argmuments:"${NOCOLOR}
 	echo -e ${CYAN} "  -h, --help    Display this help message"${NOCOLOR}
+	echo -e ${CYAN} "  -p, --path    Specify the path for running the build. This is the setup path when running 'prepare_zmk_build_environment.sh' script"${NOCOLOR}
 	echo -e ${CYAN} "  -f, --force   Force rebuild"${NOCOLOR}
 	echo -e ${CYAN} "The default (no argument) will compile the firmware"${NOCOLOR}
 	exit 1
@@ -99,8 +100,10 @@ if [ -d .venv ]; then
 		info "Running inside a Python virtual environment."
 	fi
 else
-  error "No .venv directory found. Please run prepare_zmk_build_environment.sh first."
-  exit 1
+  if [[ -z "$VIRTUAL_ENV" ]]; then
+		error "Neither .venv directory found nor Python virtual environment not detected. Please run prepare_zmk_build_environment.sh first."
+    exit 1
+  fi
 fi
 
 info "Export Zephyr CMake package..."
