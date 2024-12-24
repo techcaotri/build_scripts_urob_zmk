@@ -33,12 +33,12 @@ show_help() {
 	echo
 	echo -e ${CYAN} "Description:"${NOCOLOR}
 	echo -e ${CYAN} "  Prepares the ZMK build environment for split keyboards based on urob's layout."${NOCOLOR}
-	echo -e ${CYAN} "  Supported keyboards include Advantage360 Pro, Sofle v2, and Sofle nicenano v2 choc."${NOCOLOR}
+	echo -e ${CYAN} "  Supported keyboards include Advantage360 Pro, Sofle v2, Sofle nicenano v2 choc, and Corne nicenano v2 choc."${NOCOLOR}
 	echo
 	echo -e ${CYAN} "Options:"${NOCOLOR}
 	echo -e ${CYAN} "  -h, --help            Show this help message and exit."${NOCOLOR}
 	echo -e ${CYAN} "  -d, --device DEVICE   Specify the device to prepare the build environment for."${NOCOLOR}
-	echo -e ${CYAN} "                        Available devices: adv360-pro, sofle_v2, sofle_nicenano_v2."${NOCOLOR}
+	echo -e ${CYAN} "                        Available devices: adv360-pro, sofle_v2, sofle_nicenano_v2, corne_nicenano_v2_choc."${NOCOLOR}
 	echo -e ${CYAN} "  -p, --path PATH       Specify the path for setting up the build environment."${NOCOLOR}
 	echo -e ${CYAN} "  -v, --version         Display the current version of the script."${NOCOLOR}
 }
@@ -223,6 +223,54 @@ prepare_sofle_nicenano_v2() {
   pip install -r zephyr/scripts/requirements.txt
 }
 
+prepare_corne_nicenano_v2_choc() {
+	info "Preparing environment for Corne nicenano v2 choc"
+	# Add specific steps for Corne nicenano v2 choc
+
+	info "Checking source from-urob-zmk-config file exist..."
+	if [ ! -d from-urob-zmk-config ]; then
+    info "Cloning source from-urob-zmk-config directory for Corne nicenano v2 choc"
+		git clone --recurse-submodules -j8 -b tripham_corne_choc git@github.com:techcaotri/from-urob-zmk-config.git
+	fi
+
+  info "Checking new keypos_def header file exist..."
+	if [ ! -f from-urob-zmk-config/zmk-nodefree-config/keypos_def/keypos_60keys.h ]; then
+    info "Create soft link for config west.yml file..."
+    pushd .
+    cd from-urob-zmk-config/zmk-nodefree-config/keypos_def
+    ln -sf ../../keypos_def/keypos_42keys.h .
+    popd
+	fi
+
+	info "Checking config file exist..."
+	if [ ! -f config/west.yml ]; then
+    info "Create soft link for config west.yml file..."
+		mkdir -p config && cd config
+    ln -sf "$(pwd)/../from-urob-zmk-config/config/west.yml" .
+		cd ..
+	fi
+
+  info "Checking build.yml file exist..."
+	if [ ! -f build.yaml ]; then
+    info "Create soft link for build.yaml file exist..."
+    ln -sf from-urob-zmk-config/build.yaml .
+  fi
+
+	info "Checking zmk directory exist..."
+  if [ ! -d zmk ]; then
+    info "Initializing folders according to current config..."
+    west init -l config
+    info "Updating source folders..."
+    west update
+  fi
+
+  info "Exporting CMake build environment variables..."
+  west zephyr-export
+
+  info "Installing Python requirements..."
+  pip install -r zephyr/scripts/requirements.txt
+}
+
 # Default values
 device=""
 
@@ -279,6 +327,9 @@ sofle_v2)
 	;;
 sofle_nicenano_v2)
 	prepare_sofle_nicenano_v2
+	;;
+corne_nicenano_v2_choc)
+	prepare_corne_nicenano_v2_choc
 	;;
 "")
 	error "No device specified. Use -d or --device to specify a device."
