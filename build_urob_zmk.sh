@@ -24,6 +24,10 @@ info() {
 	echo -e "${GREEN}$@${NOCOLOR}"
 }
 
+error() {
+	echo -e "${RED}$@${NOCOLOR}" >&2
+}
+
 compile_firmware() {
 	SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 	info "SCRIPT_DIR: $SCRIPT_DIR"
@@ -35,17 +39,23 @@ compile_firmware() {
 	info "ZMK_DIR: $ZMK_DIR"
 	ZEPHYR_DIR="$SOURCE_DIR/zephyr"
 	info "ZEPHYR_DIR: $ZEPHYR_DIR"
-  zephyr_version=$(awk -F ' *= *' '/VERSION_MAJOR/ {major=$2} /VERSION_MINOR/ {minor=$2} /PATCHLEVEL/ {patch=$2} END {printf "%d%d%d", major, minor, patch}' "$ZEPHYR_DIR/VERSION")
-  info "zephyr_version: $zephyr_version"
+	zephyr_version=$(awk -F ' *= *' '/VERSION_MAJOR/ {major=$2} /VERSION_MINOR/ {minor=$2} /PATCHLEVEL/ {patch=$2} END {printf "%d%d%d", major, minor, patch}' "$ZEPHYR_DIR/VERSION")
+	info "zephyr_version: $zephyr_version"
 
 	force_flag=""
 	if [ $2 = true ]; then
-      force_flag="-- -p"
+		force_flag="-- -p"
 	fi
 	echo "force_flag: $force_flag"
 	output_dir="$SCRIPT_DIR/output_uf2"
 	mkdir -p "$output_dir"
 	OPTIONS=" -l -o "$output_dir" --host-config-dir "$CONFIG_DIR" --host-zmk-dir "$ZMK_DIR" $force_flag"
+
+	pushd .
+	cd "$SOURCE_DIR" || exit
+  west zephyr-export
+  popd || exit
+
 	echo "$CONFIG_DIR"/scripts/zmk_build.sh "$OPTIONS"
 	"$CONFIG_DIR"/scripts/zmk_build.sh $OPTIONS
 }
@@ -92,10 +102,12 @@ fi
 pushd .
 cd "$path" || exit
 if [ -d .venv ]; then
-	source .venv/bin/activate
-  if [[ -z "$VIRTUAL_ENV" ]]; then
+  info "Found .venv directory at $(pwd)/.venv . Activating this Python virtual environment..."
+  source .venv/bin/activate
+  info "$(which python)"
+	if [[ -z "$VIRTUAL_ENV" ]]; then
 		error "Python virtual environment not detected."
-    exit 1
+		exit 1
 	else
 		info "Running inside a Python virtual environment."
 	fi
@@ -106,8 +118,6 @@ else
   fi
 fi
 
-info "Export Zephyr CMake package..."
-west zephyr-export
 popd || exit
 echo "force: $force"
 compile_firmware "$path" $force

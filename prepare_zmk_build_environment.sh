@@ -86,6 +86,8 @@ install_west() {
 	else
 		info "West command is available."
 	fi
+  info "Installing west dependencies..."
+  pip install pyelftools
 }
 
 prepare_adv360_pro() {
