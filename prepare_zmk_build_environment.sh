@@ -38,7 +38,7 @@ show_help() {
 	echo -e ${CYAN} "Options:"${NOCOLOR}
 	echo -e ${CYAN} "  -h, --help            Show this help message and exit."${NOCOLOR}
 	echo -e ${CYAN} "  -d, --device DEVICE   Specify the device to prepare the build environment for."${NOCOLOR}
-	echo -e ${CYAN} "                        Available devices: adv360-pro, sofle_v2, sofle_nicenano_v2, corne_nicenano_v2_choc."${NOCOLOR}
+	echo -e ${CYAN} "                        Available devices: adv360-pro, sofle_v2, sofle_nicenano_v2, corne_nicenano_v2_choc, eyelash_corne."${NOCOLOR}
 	echo -e ${CYAN} "  -p, --path PATH       Specify the path for setting up the build environment."${NOCOLOR}
 	echo -e ${CYAN} "  -v, --version         Display the current version of the script."${NOCOLOR}
 }
@@ -273,6 +273,45 @@ prepare_corne_nicenano_v2_choc() {
   pip install -r zephyr/scripts/requirements.txt
 }
 
+prepare_eyelash_corne() {
+	info "Preparing environment for Eyelash Corne nicenano"
+	# Add specific steps for Eyelash Corne nicenano
+
+	info "Checking source from-urob-zmk-config file exist..."
+	if [ ! -d from-urob-zmk-config ]; then
+    info "Cloning source from-urob-zmk-config directory for Eyelash Corne nicenano"
+		git clone --recurse-submodules -j8 -b eyelash_corne git@github.com:techcaotri/from-urob-zmk-config.git
+	fi
+
+	info "Checking config file exist..."
+	if [ ! -f config/west.yml ]; then
+    info "Create soft link for config west.yml file..."
+		mkdir -p config && cd config
+    ln -sf "$(pwd)/../from-urob-zmk-config/config/west.yml" .
+		cd ..
+	fi
+
+  info "Checking build.yml file exist..."
+	if [ ! -f build.yaml ]; then
+    info "Create soft link for build.yaml file exist..."
+    ln -sf from-urob-zmk-config/build.yaml .
+  fi
+
+	info "Checking zmk directory exist..."
+  if [ ! -d zmk ]; then
+    info "Initializing folders according to current config..."
+    west init -l config
+    info "Updating source folders..."
+    west update
+  fi
+
+  info "Exporting CMake build environment variables..."
+  west zephyr-export
+
+  info "Installing Python requirements..."
+  pip install -r zephyr/scripts/requirements.txt
+}
+
 # Default values
 device=""
 
@@ -332,6 +371,9 @@ sofle_nicenano_v2)
 	;;
 corne_nicenano_v2_choc)
 	prepare_corne_nicenano_v2_choc
+	;;
+eyelash_corne)
+	prepare_eyelash_corne
 	;;
 "")
 	error "No device specified. Use -d or --device to specify a device."

@@ -120,4 +120,7 @@ fi
 
 popd || exit
 echo "force: $force"
+
+export ZEPHYR_TOOLCHAIN_VARIANT=zephyr
+export ZEPHYR_SDK_INSTALL_DIR=~/zephyr_sdk/
 compile_firmware "$path" $force
