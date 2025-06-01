@@ -44,12 +44,25 @@ compile_firmware() {
 
 	force_flag=""
 	if [ $2 = true ]; then
-		force_flag="-- -p"
+		force_flag="-p"
 	fi
 	echo "force_flag: $force_flag"
+	zmk_logging=""
+	if [ $3 = true ]; then
+		zmk_logging="-S zmk-usb-logging"
+	fi
+	echo "zmk_logging: $zmk_logging"
+
+  # Check if force_flag or zmk_logging is set, then add to WEST_OPTS
+  if [ -n "$force_flag" ] || [ -n "$zmk_logging" ]; then
+    WEST_OPTS="-- $force_flag $zmk_logging"
+  else
+    WEST_OPTS=""
+  fi
+	echo "WEST_OPTS: $WEST_OPTS"
 	output_dir="$SCRIPT_DIR/output_uf2"
 	mkdir -p "$output_dir"
-	OPTIONS=" -l -o "$output_dir" --host-config-dir "$CONFIG_DIR" --host-zmk-dir "$ZMK_DIR" $force_flag"
+	OPTIONS=" -l -o "$output_dir" --host-config-dir "$CONFIG_DIR" --host-zmk-dir "$ZMK_DIR" $WEST_OPTS"
 
 	pushd .
 	cd "$SOURCE_DIR" || exit
@@ -72,6 +85,7 @@ usage() {
 }
 
 force=false
+zmk_logging=false
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	-h | --help)
@@ -87,6 +101,10 @@ while [[ $# -gt 0 ]]; do
 		force=true
 		shift
 		;;
+  -l | --zmk-logging)
+    zmk_logging=true
+    shift
+    ;;
 	*)
 		usage
 		exit 1
@@ -123,4 +141,4 @@ echo "force: $force"
 
 export ZEPHYR_TOOLCHAIN_VARIANT=zephyr
 export ZEPHYR_SDK_INSTALL_DIR=~/zephyr_sdk/
-compile_firmware "$path" $force
+compile_firmware "$path" $force "$zmk_logging"
