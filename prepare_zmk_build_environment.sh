@@ -42,6 +42,8 @@ show_help() {
 	echo -e ${CYAN} "  -p, --path PATH       Specify the path for setting up the build environment."${NOCOLOR}
 	echo -e ${CYAN} "  -y, --python PYTHON   Python interpreter used to create the .venv (e.g. python3.12)."${NOCOLOR}
 	echo -e ${CYAN} "                        Defaults to the newest python3.x found. Zephyr 4.x needs >= 3.10."${NOCOLOR}
+	echo -e ${CYAN} "      --no-serial-monitor   Do not install pyserial into the .venv (the no-sudo serial"${NOCOLOR}
+	echo -e ${CYAN} "                        monitor used by build_urob_zmk.sh -m to read firmware USB logs)."${NOCOLOR}
 	echo -e ${CYAN} "  -v, --version         Display the current version of the script."${NOCOLOR}
 }
 
@@ -108,6 +110,17 @@ install_west() {
 	fi
   info "Installing west dependencies..."
   pip install pyelftools
+
+  # pyserial gives a no-sudo, cross-platform serial monitor in the venv
+  # (python -m serial.tools.miniterm), used by build_urob_zmk.sh -m/--monitor to
+  # watch firmware USB logs while testing/tuning gestures. Opt out with
+  # --no-serial-monitor.
+  if [[ "$install_serial_monitor" != "false" ]]; then
+    info "Installing pyserial (serial monitor for firmware USB logs)..."
+    pip install pyserial
+  else
+    info "Skipping pyserial install (--no-serial-monitor)."
+  fi
 }
 
 prepare_adv360_pro() {
@@ -416,6 +429,7 @@ prepare_eyelash_corne_dongle() {
 # Default values
 device=""
 python_bin=""
+install_serial_monitor=true
 
 # Parse command-line options
 while [[ $# -gt 0 ]]; do
@@ -438,6 +452,10 @@ while [[ $# -gt 0 ]]; do
 		python_bin="$2"
 		shift # past argument
 		shift # past value
+		;;
+	--no-serial-monitor)
+		install_serial_monitor=false
+		shift # past argument
 		;;
 	-v | --version)
 		show_version

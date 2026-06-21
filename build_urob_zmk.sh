@@ -28,6 +28,53 @@ error() {
 	echo -e "${RED}$@${NOCOLOR}" >&2
 }
 
+# Open a serial monitor on the keyboard's USB-CDC console (the half built with the
+# zmk-usb-logging snippet, see -l). Used to watch the IQS5xx driver's LOG_INF /
+# LOG_ERR output while testing and tuning gestures (gestures guide section 9).
+#
+# Tries, in order: the venv's pyserial miniterm (no sudo, installed by prepare),
+# then tio / picocom / screen. Quit keys differ per tool (printed below).
+monitor_serial() {
+	local dev="$1" baud="$2"
+	[[ -z "$baud" ]] && baud=115200
+
+	# Auto-detect the first USB-CDC ACM device when none was given.
+	if [[ -z "$dev" ]]; then
+		dev=$(ls /dev/ttyACM* 2>/dev/null | head -n1)
+		# macOS / other CDC names as a fallback.
+		[[ -z "$dev" ]] && dev=$(ls /dev/tty.usbmodem* /dev/ttyUSB* 2>/dev/null | head -n1)
+	fi
+	if [[ -z "$dev" ]]; then
+		error "No serial device found (looked for /dev/ttyACM*). Plug in the half built"
+		error "with -l/--zmk-logging, or pass --monitor-device /dev/ttyACMx."
+		return 1
+	fi
+	if [[ ! -e "$dev" ]]; then
+		error "Serial device '$dev' does not exist."
+		return 1
+	fi
+
+	info "Opening serial monitor on $dev @ ${baud} baud..."
+	if python -c 'import serial.tools.miniterm' &>/dev/null; then
+		info "  (pyserial miniterm — quit with Ctrl-])"
+		python -m serial.tools.miniterm "$dev" "$baud"
+	elif command -v tio &>/dev/null; then
+		info "  (tio — quit with Ctrl-t then q)"
+		tio -b "$baud" "$dev"
+	elif command -v picocom &>/dev/null; then
+		info "  (picocom — quit with Ctrl-a then Ctrl-x)"
+		picocom -b "$baud" "$dev"
+	elif command -v screen &>/dev/null; then
+		info "  (screen — quit with Ctrl-a then k)"
+		screen "$dev" "$baud"
+	else
+		error "No serial monitor available. Install one of:"
+		error "  pip install pyserial   (then re-run; preferred, no sudo)"
+		error "  sudo apt install tio   |   picocom   |   screen"
+		return 1
+	fi
+}
+
 compile_firmware() {
 	SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 	info "SCRIPT_DIR: $SCRIPT_DIR"
@@ -80,7 +127,16 @@ compile_firmware() {
 	output_dir="$SCRIPT_DIR/$output_name"
 	info "output_dir: $output_dir"
 	mkdir -p "$output_dir"
-	OPTIONS=" -l -o "$output_dir" --host-config-dir "$CONFIG_DIR" --host-zmk-dir "$ZMK_DIR" $WEST_OPTS"
+
+	# Optional board filter: build only the matching build.yaml entries (e.g.
+	# just the peripheral half with logging: -b eyelash_corne_right -l).
+	board_opt=""
+	if [ -n "$board" ]; then
+		board_opt="-b $board"
+		info "board filter: $board"
+	fi
+
+	OPTIONS=" -l -o "$output_dir" --host-config-dir "$CONFIG_DIR" --host-zmk-dir "$ZMK_DIR" $board_opt $WEST_OPTS"
 
 	pushd .
 	cd "$SOURCE_DIR" || exit
@@ -92,21 +148,41 @@ compile_firmware() {
 }
 
 usage() {
-	echo -e ${CYAN} "Usage: $0 [-h|--help] [-p --path path] [-f|--force]"${NOCOLOR}
+	echo -e ${CYAN} "Usage: $0 -p PATH [options]"${NOCOLOR}
 	echo
-	echo -e ${CYAN} "Argmuments:"${NOCOLOR}
-	echo -e ${CYAN} "  -h, --help    Display this help message"${NOCOLOR}
-	echo -e ${CYAN} "  -p, --path    Specify the path for running the build. This is the setup path when running 'prepare_zmk_build_environment.sh' script"${NOCOLOR}
-	echo -e ${CYAN} "  -o, --output-name   Name of the output sub-directory (under the script dir) for the compiled .uf2/.bin firmware. Default: output_uf2"${NOCOLOR}
-	echo -e ${CYAN} "  -f, --force   Force rebuild"${NOCOLOR}
-	echo -e ${CYAN} "  -l, --zmk-logging   Build with the zmk-usb-logging snippet enabled"${NOCOLOR}
-	echo -e ${CYAN} "The default (no argument) will compile the firmware"${NOCOLOR}
+	echo -e ${CYAN} "Build options:"${NOCOLOR}
+	echo -e ${CYAN} "  -h, --help            Display this help message"${NOCOLOR}
+	echo -e ${CYAN} "  -p, --path PATH       Workspace path (the same -p used with prepare_zmk_build_environment.sh). Required."${NOCOLOR}
+	echo -e ${CYAN} "  -o, --output-name N   Output sub-directory (under the script dir) for the .uf2/.bin. Default: output_uf2"${NOCOLOR}
+	echo -e ${CYAN} "  -f, --force           Force a clean (pristine) rebuild"${NOCOLOR}
+	echo -e ${CYAN} "  -b, --board BOARD     Build only build.yaml entries for this board (e.g. eyelash_corne_right)."${NOCOLOR}
+	echo -e ${CYAN} "                        Comma/space separated for several. Default: every entry in build.yaml."${NOCOLOR}
+	echo
+	echo -e ${CYAN} "Testing / logging / tuning (see the gestures guide, section 9):"${NOCOLOR}
+	echo -e ${CYAN} "  -l, --zmk-logging     Build with the zmk-usb-logging snippet (USB-CDC serial console for LOG_INF/LOG_ERR)."${NOCOLOR}
+	echo -e ${CYAN} "  -m, --monitor         After building, open a serial monitor on the logging half's USB-CDC device."${NOCOLOR}
+	echo -e ${CYAN} "      --monitor-only    Skip building; just open the serial monitor."${NOCOLOR}
+	echo -e ${CYAN} "      --monitor-device D   Serial device to monitor (default: auto-detect /dev/ttyACM*)."${NOCOLOR}
+	echo -e ${CYAN} "      --baud RATE       Serial monitor baud rate. Default: 115200."${NOCOLOR}
+	echo
+	echo -e ${CYAN} "Examples:"${NOCOLOR}
+	echo -e ${CYAN} "  # Build everything, clean:"${NOCOLOR}
+	echo -e ${CYAN} "  $0 -p WS -o out_tp -f"${NOCOLOR}
+	echo -e ${CYAN} "  # Debug the touchpad: build ONLY the right/peripheral half with logging, then watch logs:"${NOCOLOR}
+	echo -e ${CYAN} "  $0 -p WS -o out_tp -b eyelash_corne_right -l -f -m"${NOCOLOR}
+	echo -e ${CYAN} "  # Just re-open the serial monitor (firmware already flashed):"${NOCOLOR}
+	echo -e ${CYAN} "  $0 -p WS --monitor-only"${NOCOLOR}
 	exit 1
 }
 
 force=false
 zmk_logging=false
 output_name="output_uf2"
+board=""
+monitor=false
+monitor_only=false
+monitor_device=""
+baud=115200
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	-h | --help)
@@ -127,10 +203,33 @@ while [[ $# -gt 0 ]]; do
 		force=true
 		shift
 		;;
+	-b | --board)
+		board="$2"
+		shift # past argument
+		shift # past value
+		;;
   -l | --zmk-logging)
     zmk_logging=true
     shift
     ;;
+	-m | --monitor)
+		monitor=true
+		shift
+		;;
+	--monitor-only)
+		monitor_only=true
+		shift
+		;;
+	--monitor-device)
+		monitor_device="$2"
+		shift
+		shift
+		;;
+	--baud)
+		baud="$2"
+		shift
+		shift
+		;;
 	*)
 		usage
 		exit 1
@@ -167,4 +266,13 @@ echo "force: $force"
 
 export ZEPHYR_TOOLCHAIN_VARIANT=zephyr
 export ZEPHYR_SDK_INSTALL_DIR=~/zephyr_sdk/
-compile_firmware "$path" $force "$zmk_logging" "$output_name"
+
+if [ "$monitor_only" = true ]; then
+	info "Skipping build (--monitor-only)."
+else
+	compile_firmware "$path" $force "$zmk_logging" "$output_name"
+fi
+
+if [ "$monitor" = true ] || [ "$monitor_only" = true ]; then
+	monitor_serial "$monitor_device" "$baud"
+fi

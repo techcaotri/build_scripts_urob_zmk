@@ -27,6 +27,7 @@ branch for the device you ask for.
 - [`build_urob_zmk.sh`](#build_urob_zmksh)
 - [How a prepared workspace is structured](#how-a-prepared-workspace-is-structured)
 - [Output firmware](#output-firmware)
+- [Debugging & serial logging](#debugging--serial-logging)
 - [Worked example: the `eyelash_corne_touchpad` variant](#worked-example-the-eyelash_corne_touchpad-variant)
 - [Versioning &amp; reproducibility (important)](#versioning--reproducibility-important)
 - [Troubleshooting](#troubleshooting)
@@ -129,6 +130,7 @@ prepare_zmk_build_environment.sh [-h] [-d DEVICE] [-p PATH] [-y PYTHON] [-v]
 | `-d`, `--device` | `DEVICE` | Variant to prepare (see [Supported devices](#supported-devices)). **Required.** |
 | `-p`, `--path` | `PATH` | Directory to create/use as the build workspace. Created if missing. **Required.** |
 | `-y`, `--python` | `PYTHON` | Python interpreter used to create `.venv` (e.g. `python3.12`). Defaults to the first of `python3.9 → python3.10 → python3.11 → python3.12 → python3` found. |
+| `--no-serial-monitor` | — | Skip installing `pyserial` into `.venv`. `pyserial` provides `python -m serial.tools.miniterm`, the no-sudo serial monitor `build_urob_zmk.sh -m` uses to read firmware USB logs. |
 | `-v`, `--version` | — | Print script version and exit. |
 
 ### What it does (in order)
@@ -137,7 +139,9 @@ prepare_zmk_build_environment.sh [-h] [-d DEVICE] [-p PATH] [-y PYTHON] [-v]
 2. **`check_python_venv`** — reuse an existing `.venv` if present; otherwise
    create one with the resolved interpreter and activate it.
 3. **`check_python_version`** — sanity-check that Python ≥ 3.8.
-4. **`install_west`** — `pip install west pyelftools` into the venv if needed.
+4. **`install_west`** — `pip install west pyelftools` into the venv if needed,
+   plus `pyserial` (the no-sudo serial monitor for firmware USB logs) unless
+   `--no-serial-monitor`.
 5. **`prepare_<device>`** — the per-variant routine:
    - `git clone --recurse-submodules -b <branch> …/from-urob-zmk-config.git`
    - symlink `config/west.yml` and `build.yaml` into the workspace root,
@@ -178,7 +182,17 @@ build_urob_zmk.sh [-h] [-p PATH] [-o OUTPUT_NAME] [-f] [-l]
 | `-p`, `--path` | `PATH` | The workspace previously set up by `prepare_zmk_build_environment.sh`. **Required.** |
 | `-o`, `--output-name` | `NAME` | Output sub-directory name (under this script's directory) for the `.uf2`/`.bin` files. Default: `output_uf2`. Use a per-variant name to avoid clobbering other variants' firmware. |
 | `-f`, `--force` | — | Force a clean rebuild (passes pristine `-p` to `west build`). |
-| `-l`, `--zmk-logging` | — | Build with the `zmk-usb-logging` snippet enabled (USB serial logging). |
+| `-b`, `--board` | `BOARD` | Build **only** the `build.yaml` entries whose board matches (comma/space separated for several). Each kept entry uses its own shield, so e.g. `-b eyelash_corne_right` builds just the (shield-less) peripheral half. Default: every entry. |
+
+**Testing / logging / tuning** (see [Debugging & serial logging](#debugging--serial-logging) and §9 of the gestures guide):
+
+| Option | Argument | Description |
+| --- | --- | --- |
+| `-l`, `--zmk-logging` | — | Build with the `zmk-usb-logging` snippet — adds a USB-CDC serial console streaming `LOG_INF`/`LOG_ERR`. |
+| `-m`, `--monitor` | — | After building, open a serial monitor on the logging half's USB-CDC device. |
+| `--monitor-only` | — | Skip the build; just open the serial monitor. |
+| `--monitor-device` | `DEV` | Serial device to monitor. Default: auto-detect first `/dev/ttyACM*` (then `tty.usbmodem*`/`ttyUSB*`). |
+| `--baud` | `RATE` | Serial monitor baud. Default: `115200`. |
 
 ### What it does (in order)
 
@@ -189,12 +203,16 @@ build_urob_zmk.sh [-h] [-p PATH] [-o OUTPUT_NAME] [-f] [-l]
 3. **Export `ZEPHYR_BASE=$ZEPHYR_DIR`** — pins `find_package(Zephyr)` to *this*
    workspace's Zephyr so the shared `~/.cmake/packages/Zephyr` registry can't
    accidentally resolve to a different variant's Zephyr.
-4. `west zephyr-export`, then invoke
+4. Unless `--monitor-only`: `west zephyr-export`, then invoke
    `from-urob-zmk-config/scripts/zmk_build.sh -l` with the host config/zmk dirs
-   and (optionally) `-p` for force and `-S zmk-usb-logging` for logging.
+   and (optionally) `-p` for force, `-S zmk-usb-logging` for logging, and
+   `-b BOARD` to filter the build list.
 5. Copy each built `zmk.uf2`/`zmk.bin` into
    `./<output-name>/<board>_<shield>-zmk.uf2`, backing up any previous file to
-   `*.bak`.
+   `*.bak`. A shield-less board uses the suffix `nodisplay`.
+6. If `-m`/`--monitor` (or `--monitor-only`): open a serial monitor on the device
+   (auto-detected or `--monitor-device`), preferring the venv's `pyserial`
+   miniterm, then `tio` / `picocom` / `screen`.
 
 ### Examples
 
@@ -204,6 +222,13 @@ build_urob_zmk.sh [-h] [-p PATH] [-o OUTPUT_NAME] [-f] [-l]
 
 # Per-variant output folder + clean rebuild + USB logging
 ./build_urob_zmk.sh -p ~/kb/eyelash_tp -o output_uf2_eyelash_corne_touchpad -f -l
+
+# Debug a touchpad gesture: build ONLY the peripheral half with logging, then watch
+./build_urob_zmk.sh -p ~/kb/eyelash_tp -o output_uf2_eyelash_corne_touchpad \
+    -b eyelash_corne_right -l -f -m
+
+# Re-open the serial monitor on an already-flashed board (no build)
+./build_urob_zmk.sh -p ~/kb/eyelash_tp --monitor-only --monitor-device /dev/ttyACM0
 ```
 
 ---
@@ -316,6 +341,45 @@ workspace with `--python python3.12` (or any ≥ 3.10).
 > The same pinning discipline applies to the other variants: when their upstream
 > branches drift onto an incompatible Zephyr, pin the manifest to a known-good
 > commit set rather than chasing `main`.
+
+---
+
+## Debugging & serial logging
+
+ZMK can stream `LOG_INF`/`LOG_ERR` over a **USB-CDC serial console** when built
+with the `zmk-usb-logging` snippet. `build_urob_zmk.sh` wires this into three
+options so you can build a logging firmware and read it without leaving the script:
+
+- **`-l` / `--zmk-logging`** — build with the logging snippet.
+- **`-b` / `--board`** — build only the half you're debugging (faster loop). On a
+  split, logging is over USB, so build + cable the half whose driver you want to
+  watch (e.g. the touchpad **peripheral**, `eyelash_corne_right`).
+- **`-m` / `--monitor`**, **`--monitor-only`**, **`--monitor-device`**, **`--baud`**
+  — open a serial monitor on the board's USB-CDC device.
+
+The monitor prefers the venv's **`pyserial`** (`python -m serial.tools.miniterm`,
+installed by `prepare_*` unless `--no-serial-monitor`), then falls back to `tio`,
+`picocom`, or `screen`. With no `--monitor-device` it auto-detects the first
+`/dev/ttyACM*` (then `tty.usbmodem*` / `ttyUSB*`).
+
+```bash
+# Build only the peripheral half with logging, flash it, then watch its logs:
+./build_urob_zmk.sh -p WS -o out_tp -b eyelash_corne_right -l -f -m
+
+# Re-open the monitor later (no rebuild), explicit device:
+./build_urob_zmk.sh -p WS --monitor-only --monitor-device /dev/ttyACM0 --baud 115200
+```
+
+> **Which half to cable.** USB logging only reaches the host from the half plugged
+> in by USB. To read a peripheral-side driver (like the Azoteq touchpad), flash and
+> cable the **peripheral** half. Per-board build logs are also written to
+> `/tmp/zmk_build_<board>.log`.
+
+For the full gesture-debugging workflow (what to look for in the logs — finger
+count, gesture bits, the zoom-delta register, orientation sign — and how to tune),
+see the touchpad project's
+[`README.md` → "Debugging & analyzing the firmware"](../Eyelash-Corne-Touchpad/README.md)
+and §9 of its gestures guide.
 
 ---
 
