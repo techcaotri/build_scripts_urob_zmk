@@ -110,34 +110,6 @@ install_west() {
   pip install pyelftools
 }
 
-# Link the locally-edited Azoteq IQS5xx driver (with the custom pinch-zoom and
-# three-finger-swipe gestures) into the west workspace so the build compiles our
-# code instead of the pristine upstream checkout fetched by `west update`.
-#
-# Layout: the editable driver lives next to the build workspace, i.e. at
-# <workspace>/../zmk-driver-azoteq-iqs5xx. config/west.yml references the module
-# by the name `zmk-driver-azoteq-iqs5xx`; we make that workspace path a symlink
-# to the editable copy. Run from inside the workspace ($path).
-link_local_iqs5xx_driver() {
-	local driver_local
-	driver_local="$(dirname "$(pwd)")/zmk-driver-azoteq-iqs5xx"
-
-	if [ ! -d "$driver_local" ]; then
-		info "Editable IQS5xx driver not found at $driver_local; cloning upstream as a base..."
-		git clone https://github.com/AYM1607/zmk-driver-azoteq-iqs5xx.git "$driver_local" || {
-			error "Failed to clone the Azoteq IQS5xx driver."
-			return 1
-		}
-	fi
-
-	# Replace whatever west placed at the module path with a symlink to our copy.
-	if [ ! -L zmk-driver-azoteq-iqs5xx ]; then
-		rm -rf zmk-driver-azoteq-iqs5xx
-	fi
-	ln -sfn "$driver_local" zmk-driver-azoteq-iqs5xx
-	info "Linked Azoteq IQS5xx driver: $(pwd)/zmk-driver-azoteq-iqs5xx -> $driver_local"
-}
-
 prepare_adv360_pro() {
 	info "Preparing environment for Advantage360 Pro"
 	# Add specific steps for Advantage360 Pro
@@ -391,15 +363,12 @@ prepare_eyelash_corne_touchpad() {
     info "Updating source folders..."
     west update
   else
-    info "Workspace exists; fetching any newly-added west modules (e.g. the touchpad driver)..."
+    info "Workspace exists; fetching any newly-added/updated west modules (e.g. the touchpad driver)..."
     west update zmk-driver-azoteq-iqs5xx || west update
   fi
 
   info "Exporting CMake build environment variables..."
   west zephyr-export
-
-  info "Linking the local Azoteq IQS5xx touchpad driver into the workspace..."
-  link_local_iqs5xx_driver
 
   info "Installing Python requirements..."
   pip install -r zephyr/scripts/requirements.txt
