@@ -39,8 +39,24 @@ compile_firmware() {
 	info "ZMK_DIR: $ZMK_DIR"
 	ZEPHYR_DIR="$SOURCE_DIR/zephyr"
 	info "ZEPHYR_DIR: $ZEPHYR_DIR"
+	# Pin the Zephyr used by find_package(Zephyr) to THIS workspace. Every prepared
+	# variant registers its zephyr in ~/.cmake/packages/Zephyr, so without this the
+	# CMake user package registry may resolve to a different variant's Zephyr. With
+	# ZEPHYR_BASE set, Zephyr's version check rejects every registered copy but this one.
+	export ZEPHYR_BASE="$ZEPHYR_DIR"
+	info "ZEPHYR_BASE: $ZEPHYR_BASE"
 	zephyr_version=$(awk -F ' *= *' '/VERSION_MAJOR/ {major=$2} /VERSION_MINOR/ {minor=$2} /PATCHLEVEL/ {patch=$2} END {printf "%d%d%d", major, minor, patch}' "$ZEPHYR_DIR/VERSION")
 	info "zephyr_version: $zephyr_version"
+
+	# Touchpad: if this config pulls in the Azoteq IQS5xx driver, make sure the
+	# module is actually present in the workspace (it is linked there by
+	# prepare_zmk_build_environment.sh). Otherwise the touchpad + custom gesture
+	# code would silently not be compiled.
+	if grep -q "zmk-driver-azoteq-iqs5xx" "$CONFIG_DIR/config/west.yml" 2>/dev/null &&
+		[ ! -e "$SOURCE_DIR/zmk-driver-azoteq-iqs5xx/zephyr/module.yml" ]; then
+		error "west.yml references zmk-driver-azoteq-iqs5xx but the module is missing under $SOURCE_DIR."
+		error "Run: $SCRIPT_DIR/prepare_zmk_build_environment.sh -d eyelash_corne_touchpad -p $SOURCE_DIR"
+	fi
 
 	force_flag=""
 	if [ $2 = true ]; then
@@ -60,7 +76,9 @@ compile_firmware() {
     WEST_OPTS=""
   fi
 	echo "WEST_OPTS: $WEST_OPTS"
-	output_dir="$SCRIPT_DIR/output_uf2"
+	output_name="${4:-output_uf2}"
+	output_dir="$SCRIPT_DIR/$output_name"
+	info "output_dir: $output_dir"
 	mkdir -p "$output_dir"
 	OPTIONS=" -l -o "$output_dir" --host-config-dir "$CONFIG_DIR" --host-zmk-dir "$ZMK_DIR" $WEST_OPTS"
 
@@ -79,13 +97,16 @@ usage() {
 	echo -e ${CYAN} "Argmuments:"${NOCOLOR}
 	echo -e ${CYAN} "  -h, --help    Display this help message"${NOCOLOR}
 	echo -e ${CYAN} "  -p, --path    Specify the path for running the build. This is the setup path when running 'prepare_zmk_build_environment.sh' script"${NOCOLOR}
+	echo -e ${CYAN} "  -o, --output-name   Name of the output sub-directory (under the script dir) for the compiled .uf2/.bin firmware. Default: output_uf2"${NOCOLOR}
 	echo -e ${CYAN} "  -f, --force   Force rebuild"${NOCOLOR}
+	echo -e ${CYAN} "  -l, --zmk-logging   Build with the zmk-usb-logging snippet enabled"${NOCOLOR}
 	echo -e ${CYAN} "The default (no argument) will compile the firmware"${NOCOLOR}
 	exit 1
 }
 
 force=false
 zmk_logging=false
+output_name="output_uf2"
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	-h | --help)
@@ -94,6 +115,11 @@ while [[ $# -gt 0 ]]; do
 		;;
 	-p | --path)
 		path="$2"
+		shift # past argument
+		shift # past value
+		;;
+	-o | --output-name)
+		output_name="$2"
 		shift # past argument
 		shift # past value
 		;;
@@ -141,4 +167,4 @@ echo "force: $force"
 
 export ZEPHYR_TOOLCHAIN_VARIANT=zephyr
 export ZEPHYR_SDK_INSTALL_DIR=~/zephyr_sdk/
-compile_firmware "$path" $force "$zmk_logging"
+compile_firmware "$path" $force "$zmk_logging" "$output_name"

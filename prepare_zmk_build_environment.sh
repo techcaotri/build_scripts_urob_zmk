@@ -38,8 +38,10 @@ show_help() {
 	echo -e ${CYAN} "Options:"${NOCOLOR}
 	echo -e ${CYAN} "  -h, --help            Show this help message and exit."${NOCOLOR}
 	echo -e ${CYAN} "  -d, --device DEVICE   Specify the device to prepare the build environment for."${NOCOLOR}
-	echo -e ${CYAN} "                        Available devices: adv360-pro, sofle_v2, sofle_nicenano_v2, corne_nicenano_v2_choc, eyelash_corne, eyelash_corne_dongle."${NOCOLOR}
+	echo -e ${CYAN} "                        Available devices: adv360-pro, sofle_v2, sofle_nicenano_v2, corne_nicenano_v2_choc, eyelash_corne, eyelash_corne_touchpad, eyelash_corne_dongle."${NOCOLOR}
 	echo -e ${CYAN} "  -p, --path PATH       Specify the path for setting up the build environment."${NOCOLOR}
+	echo -e ${CYAN} "  -y, --python PYTHON   Python interpreter used to create the .venv (e.g. python3.12)."${NOCOLOR}
+	echo -e ${CYAN} "                        Defaults to the newest python3.x found. Zephyr 4.x needs >= 3.10."${NOCOLOR}
 	echo -e ${CYAN} "  -v, --version         Display the current version of the script."${NOCOLOR}
 }
 
@@ -53,9 +55,27 @@ check_python_venv() {
 	fi
 
 	if [[ -z "$VIRTUAL_ENV" ]]; then
-		info "Python virtual environment not detected. Creating one..."
-		if ! python3.9 -m venv .venv; then
-			error "Failed to create Python 3.9 virtual environment."
+		# Resolve a suitable Python interpreter. The boards here pin Zephyr
+		# v3.5.0+zmk-fixes, which is validated against Python 3.9 (and breaks on
+		# 3.12 where distutils was removed), so default to python3.9. Newer Zephyr
+		# (>= 4.x) needs >= 3.10 -- pass --python python3.12 in that case. An
+		# explicit --python override always wins; otherwise fall back gracefully.
+		local py="$python_bin"
+		if [[ -z "$py" ]]; then
+			for candidate in python3.9 python3.10 python3.11 python3.12 python3; do
+				if command -v "$candidate" &>/dev/null; then
+					py="$candidate"
+					break
+				fi
+			done
+		fi
+		if [[ -z "$py" ]]; then
+			error "No suitable Python interpreter found. Install Python (>= 3.10 for Zephyr 4.x)."
+			exit 1
+		fi
+		info "Python virtual environment not detected. Creating one with '$py' ($("$py" --version 2>&1))..."
+		if ! "$py" -m venv .venv; then
+			error "Failed to create a Python virtual environment with '$py'."
 			exit 1
 		fi
 		info "Virtual environment created at '.venv/'"
@@ -88,6 +108,34 @@ install_west() {
 	fi
   info "Installing west dependencies..."
   pip install pyelftools
+}
+
+# Link the locally-edited Azoteq IQS5xx driver (with the custom pinch-zoom and
+# three-finger-swipe gestures) into the west workspace so the build compiles our
+# code instead of the pristine upstream checkout fetched by `west update`.
+#
+# Layout: the editable driver lives next to the build workspace, i.e. at
+# <workspace>/../zmk-driver-azoteq-iqs5xx. config/west.yml references the module
+# by the name `zmk-driver-azoteq-iqs5xx`; we make that workspace path a symlink
+# to the editable copy. Run from inside the workspace ($path).
+link_local_iqs5xx_driver() {
+	local driver_local
+	driver_local="$(dirname "$(pwd)")/zmk-driver-azoteq-iqs5xx"
+
+	if [ ! -d "$driver_local" ]; then
+		info "Editable IQS5xx driver not found at $driver_local; cloning upstream as a base..."
+		git clone https://github.com/AYM1607/zmk-driver-azoteq-iqs5xx.git "$driver_local" || {
+			error "Failed to clone the Azoteq IQS5xx driver."
+			return 1
+		}
+	fi
+
+	# Replace whatever west placed at the module path with a symlink to our copy.
+	if [ ! -L zmk-driver-azoteq-iqs5xx ]; then
+		rm -rf zmk-driver-azoteq-iqs5xx
+	fi
+	ln -sfn "$driver_local" zmk-driver-azoteq-iqs5xx
+	info "Linked Azoteq IQS5xx driver: $(pwd)/zmk-driver-azoteq-iqs5xx -> $driver_local"
 }
 
 prepare_adv360_pro() {
@@ -312,6 +360,51 @@ prepare_eyelash_corne() {
   pip install -r zephyr/scripts/requirements.txt
 }
 
+prepare_eyelash_corne_touchpad() {
+	info "Preparing environment for Eyelash Corne nicenano With Touchpad"
+	# Add specific steps for Eyelash Corne nicenano With Touchpad
+
+	info "Checking source from-urob-zmk-config file exist..."
+	if [ ! -d from-urob-zmk-config ]; then
+    info "Cloning source from-urob-zmk-config directory for Eyelash Corne nicenano With Touchpad"
+		git clone --recurse-submodules -j8 -b eyelash_corne_touchpad git@github.com:techcaotri/from-urob-zmk-config.git
+	fi
+
+	info "Checking config file exist..."
+	if [ ! -f config/west.yml ]; then
+    info "Create soft link for config west.yml file..."
+		mkdir -p config && cd config
+    ln -sf "$(pwd)/../from-urob-zmk-config/config/west.yml" .
+		cd ..
+	fi
+
+  info "Checking build.yml file exist..."
+	if [ ! -f build.yaml ]; then
+    info "Create soft link for build.yaml file exist..."
+    ln -sf from-urob-zmk-config/build.yaml .
+  fi
+
+	info "Checking zmk directory exist..."
+  if [ ! -d zmk ]; then
+    info "Initializing folders according to current config..."
+    west init -l config
+    info "Updating source folders..."
+    west update
+  else
+    info "Workspace exists; fetching any newly-added west modules (e.g. the touchpad driver)..."
+    west update zmk-driver-azoteq-iqs5xx || west update
+  fi
+
+  info "Exporting CMake build environment variables..."
+  west zephyr-export
+
+  info "Linking the local Azoteq IQS5xx touchpad driver into the workspace..."
+  link_local_iqs5xx_driver
+
+  info "Installing Python requirements..."
+  pip install -r zephyr/scripts/requirements.txt
+}
+
 prepare_eyelash_corne_dongle() {
 	info "Preparing environment for Eyelash Corne nicenano With Dongle Receiver"
 	# Add specific steps for Eyelash Corne nicenano With Dongle Receiver
@@ -353,6 +446,7 @@ prepare_eyelash_corne_dongle() {
 
 # Default values
 device=""
+python_bin=""
 
 # Parse command-line options
 while [[ $# -gt 0 ]]; do
@@ -368,6 +462,11 @@ while [[ $# -gt 0 ]]; do
 		;;
 	-p | --path)
 		path="$2"
+		shift # past argument
+		shift # past value
+		;;
+	-y | --python)
+		python_bin="$2"
 		shift # past argument
 		shift # past value
 		;;
@@ -413,6 +512,9 @@ corne_nicenano_v2_choc)
 	;;
 eyelash_corne)
 	prepare_eyelash_corne
+	;;
+eyelash_corne_touchpad)
+	prepare_eyelash_corne_touchpad
 	;;
 eyelash_corne_dongle)
 	prepare_eyelash_corne_dongle
