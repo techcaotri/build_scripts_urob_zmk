@@ -4,6 +4,16 @@ A detailed engineering log of the issues hit while adding and building the
 `eyelash_corne_touchpad` variant with `prepare_zmk_build_environment.sh` and
 `build_urob_zmk.sh`, including root-cause analysis and the exact fixes applied.
 
+This log has **two phases**:
+
+- **Part I — Build environment** (Problems 1–4): getting the pinned Zephyr-3.5
+  stack to configure and compile at all (Python version, Zephyr resolution, the
+  `Kconfig.defconfig` board-model break, and a `BASH_ENV` automation gotcha).
+- **Part II — Touchpad integration** (Problems 5–8): wiring the Azoteq IQS5xx
+  touchpad and its three custom gestures (pinch-zoom, three-finger swipe,
+  auto-mouse layer) into that working stack. The integration recipe itself is
+  [`eyelash_corne_touchpad_gestures_guide_good.md`](eyelash_corne_touchpad_gestures_guide_good.md).
+
 > **TL;DR** — The eyelash_corne boards only build on **Zephyr `v3.5.0+zmk-fixes`
 > + Python 3.9**. The repo's west manifest tracked *moving* upstream branches, so
 > a fresh `west update` pulled **Zephyr 4.1**, which (a) demanded Python ≥ 3.10
@@ -24,6 +34,11 @@ A detailed engineering log of the issues hit while adding and building the
 - [Problem 2 — CMake resolves the wrong Zephyr (package-registry contamination)](#problem-2--cmake-resolves-the-wrong-zephyr-package-registry-contamination)
 - [Problem 3 — `Kconfig/soc/Kconfig.defconfig not found` (root cause)](#problem-3--kconfigsockconfigdefconfig-not-found-root-cause)
 - [Problem 4 — automation gotcha: `z: command not found` / `BASH_ENV`](#problem-4--automation-gotcha-z-command-not-found--bash_env)
+- **Part II — Touchpad integration**
+  - [Problem 5 — Touchpad driver silently disabled: `CONFIG_I2C` never enabled](#problem-5--touchpad-driver-silently-disabled-config_i2c-never-enabled)
+  - [Problem 6 — Driver as an out-of-tree symlink breaks `zephyr_library_amend`](#problem-6--driver-as-an-out-of-tree-symlink-breaks-zephyr_library_amend)
+  - [Problem 7 — Hand-editing `west.yml` dropped the `projects:` key](#problem-7--hand-editing-westyml-dropped-the-projects-key)
+  - [Problem 8 — A display-less right half: removing the peripheral-OLED module](#problem-8--a-display-less-right-half-removing-the-peripheral-oled-module)
 - [The complete fix, file by file](#the-complete-fix-file-by-file)
 - [Verification](#verification)
 - [Known-good reference stack](#known-good-reference-stack)
@@ -326,6 +341,279 @@ host.
 
 ---
 
+# Part II — Touchpad integration (the `eyelash_corne_touchpad` gestures)
+
+> **TL;DR (touchpad phase).** Wiring the Azoteq IQS5xx touchpad + three custom
+> gestures into the working Zephyr-3.5 stack surfaced four more build-blocking
+> issues: **(5)** the driver silently disabled because **`CONFIG_I2C` was never
+> enabled** (the Corne display is SPI, so nothing pulls in I²C the way the rolio
+> reference's I²C OLED does); **(6)** the driver consumed as a **symlink pointing
+> outside the west workspace** broke `zephyr_library_amend`; **(7)** a hand-edit of
+> `west.yml` **dropped the `projects:` key**; **(8)** removing the now-unused
+> peripheral-OLED module meant building a **display-less right half** (a board
+> entry with no shield), which the build-list parser couldn't express. Fixes:
+> `CONFIG_I2C=y`; consume the driver as a real `west` checkout from the
+> `techcaotri` fork; restore `projects:`; add a per-side `eyelash_corne_right.conf`
+> and make `build.yaml`/`zmk_build.sh` shield-optional.
+
+These are independent of Part I (the stack was already pinned and building); they
+are about bringing up the touchpad and its gestures. The step-by-step integration
+guide is [`eyelash_corne_touchpad_gestures_guide_good.md`](eyelash_corne_touchpad_gestures_guide_good.md).
+
+---
+
+## Problem 5 — Touchpad driver silently disabled: `CONFIG_I2C` never enabled
+
+### Symptom
+
+The **right** half (the only one carrying the touchpad node) failed to link:
+
+```text
+warning: INPUT_AZOTEQ_IQS5XX (defined at .../zmk-driver-azoteq-iqs5xx/drivers/input/Kconfig:1)
+  was assigned the value 'y' but got the value 'n'.
+...
+ld.bfd: app/libapp.a(input_split.c.obj): .../src/pointing/input_split.c:77:
+  undefined reference to `__device_dts_ord_34'
+collect2: error: ld returned 1 exit status
+```
+
+The left half built fine; only the right (peripheral) — where the driver and the
+`iqs5xx@74` node live — broke.
+
+### Investigation
+
+- `config/eyelash_corne.conf` set `CONFIG_INPUT_AZOTEQ_IQS5XX=y`, yet the build
+  reported it "got the value 'n'." That phrasing means an **unmet Kconfig
+  dependency** forced it back off.
+- The driver's `drivers/input/Kconfig`:
+
+  ```text
+  menuconfig INPUT_AZOTEQ_IQS5XX
+      depends on GPIO
+      depends on I2C
+      depends on INPUT
+      depends on DT_HAS_AZOTEQ_IQS5XX_ENABLED
+  ```
+
+- Dumping the generated `.config` of the right build showed which dependency was
+  missing:
+
+  ```text
+  CONFIG_GPIO=y
+  CONFIG_INPUT=y
+  CONFIG_DT_HAS_AZOTEQ_IQS5XX_ENABLED=1     # node present + binding matched
+  # CONFIG_I2C is absent                     # <-- the unmet dependency
+  ```
+
+- The `__device_dts_ord_34` link error was a **downstream symptom**: with the
+  driver excluded, the `tps43` (`iqs5xx@74`) device object is never instantiated,
+  so the `zmk,input-split` forwarder that references `device = <&tps43>` has a
+  dangling `DEVICE_DT_GET` → an undefined device ordinal at link time.
+
+### Root cause
+
+`CONFIG_I2C` is **not** auto-enabled merely by adding an `&i2c1`/TWIM node to the
+overlay on this stack. In the **rolio reference** (a Sofle) the touchpad shares
+the **OLED's I²C bus**, and the Sofle shield's `Kconfig.defconfig` does
+`config I2C / default y / if ZMK_DISPLAY` — so I²C arrives *through the display*.
+On the **eyelash_corne the display is SPI** (OLED/e-paper on `spi0`, RGB on
+`spi3`), so nothing pulls in the I²C subsystem, and the driver's `depends on I2C`
+quietly drops `CONFIG_INPUT_AZOTEQ_IQS5XX` to `n`.
+
+### Solution
+
+Enable I²C explicitly in the shared conf (`config/eyelash_corne.conf`):
+
+```ini
+# CONFIG_I2C must be set explicitly: the eyelash_corne display is SPI, so unlike
+# the rolio reference (OLED on I2C) nothing else pulls in the I2C subsystem.
+CONFIG_I2C=y
+CONFIG_INPUT=y
+CONFIG_INPUT_AZOTEQ_IQS5XX=y
+CONFIG_ZMK_POINTING=y
+```
+
+It is harmless on the left half (no I²C node there, so the bus driver
+instantiates nothing). With `CONFIG_I2C=y` the dependency chain is satisfied, the
+driver compiles, the `tps43` device exists, and `input_split` links.
+
+> **Diagnostic worth keeping:** an `undefined reference to __device_dts_ord_NN`
+> coming from `input_split.c` almost always means *the referenced input device's
+> driver didn't compile* — check that the driver's Kconfig dependencies are all
+> met, **before** suspecting the split wiring.
+
+---
+
+## Problem 6 — Driver as an out-of-tree symlink breaks `zephyr_library_amend`
+
+### Symptom
+
+A first attempt linked the driver into the workspace via a **symlink** to an
+editable copy *outside* the west workspace (so it could be edited without
+pushing). CMake configure then failed:
+
+```text
+CMake Error at .../zephyr/cmake/modules/extensions.cmake:481 (target_sources):
+  Cannot specify sources for target
+  "..__..__zmk-driver-azoteq-iqs5xx__drivers__input" which is not built by this project.
+Call Stack:
+  ... zephyr_library_sources
+  .../zmk-driver-azoteq-iqs5xx/drivers/input/CMakeLists.txt:3 (zephyr_library_sources_ifdef)
+```
+
+### Investigation
+
+- The driver's `drivers/input/CMakeLists.txt` uses the standard ZMK external-input
+  pattern — `zephyr_library_amend()` then `zephyr_library_sources_ifdef(...)`.
+  `zephyr_library_amend()` **re-opens** the library Zephyr created for the module
+  during module processing; it does not create one.
+- The offending library name — `..__..__zmk-driver-azoteq-iqs5xx__drivers__input`
+  — encodes a path with **two `../` segments**, i.e. CMake resolved the module to a
+  location *above* the workspace. The symlink at `<workspace>/zmk-driver-…` pointed
+  to `<workspace>/../zmk-driver-…`; CMake follows the symlink to its real
+  (out-of-tree) path, and the per-module library that module processing set up no
+  longer matches the name `zephyr_library_amend()` computes → "not built by this
+  project."
+- Every other module (zmk-helpers, zmk-nice-oled, …) is a **real directory at the
+  workspace root** and builds fine — confirming the symlink-to-outside-the-tree
+  was the trigger. Replacing the symlink with a plain `cp -r` of the same files
+  made the right half build and link cleanly.
+
+### Root cause
+
+`zephyr_library_amend()` relies on the module being a normal in-tree Zephyr module
+whose library context is established by `west`/module processing. A symlink whose
+real target is outside the workspace breaks the 1:1 mapping between the module's
+manifest path and its CMake library target.
+
+### Solution
+
+Stop symlinking. Consume the driver the way every other module is consumed — a
+**real `west`-managed checkout inside the workspace**:
+
+1. Push the edited driver to a fork (`techcaotri/zmk-driver-azoteq-iqs5xx`, branch
+   `feature/zoom-and-swipe`; this is Part B of the gestures guide anyway).
+2. Point `config/west.yml`'s driver project at that fork
+   (`remote: techcaotri`, `revision: feature/zoom-and-swipe`).
+3. Let `west update zmk-driver-azoteq-iqs5xx` check it out at
+   `<workspace>/zmk-driver-azoteq-iqs5xx` (a real directory, clean path).
+
+The interim `link_local_iqs5xx_driver()` helper in
+`prepare_zmk_build_environment.sh` was removed; `prepare_*` now simply `west
+update`s the module (including `west update zmk-driver-azoteq-iqs5xx` when the
+workspace already exists).
+
+> **Why the symlink was tempting:** to iterate on driver C source locally without
+> a push round-trip. It works for *vendored* modules but not for ones consumed
+> through `zephyr_library_amend()`. The fork + `west update` flow is correct and is
+> what the gestures guide prescribes.
+
+---
+
+## Problem 7 — Hand-editing `west.yml` dropped the `projects:` key
+
+### Symptom
+
+```text
+$ west manifest --path
+FATAL ERROR: can't run west manifest; it requires the manifest, which was not available.
+```
+
+`west list` returned nothing; the whole workspace looked broken.
+
+### Investigation / root cause
+
+A targeted edit that inserted the Azoteq remote accidentally **removed the
+`projects:` mapping key** that separates the `remotes:` block from the project
+list. With no `projects:` key, every project entry parsed as a continuation of
+`remotes:`, so west saw a manifest with **zero projects** → "manifest not
+available."
+
+### Solution
+
+Restore the single `projects:` line. Trivial, but the lesson is to **validate the
+manifest after any hand-edit** rather than eyeballing it:
+
+```bash
+west manifest --validate    # parse + resolve imports; non-zero exit on error
+west list                   # should show zmk (+ Zephyr via import) and every module
+```
+
+> `west.yml` is whitespace- and key-structure-sensitive. `west manifest
+> --validate` catches a dropped key, a mis-indented project, or a bad `import`
+> instantly; "it looks right" does not.
+
+---
+
+## Problem 8 — A display-less right half: removing the peripheral-OLED module
+
+### Context
+
+The touchpad physically replaced the **right-half OLED**, so
+`mario-peripheral-animation` — whose only role here was to provide the
+`nice_view_custom` peripheral-display shield — became dead weight and was removed
+from `config/west.yml` (along with the now-unused `gpeye` and `aym1607` remotes).
+Removing it has two consequences, each needing its own fix.
+
+### 8a — The right half must build with the display **off**
+
+`nice_view_custom` provided the right half's `zephyr,display` device. Dropping it
+while `CONFIG_ZMK_DISPLAY=y` (set in the shared `eyelash_corne.conf`, which the
+**left** half still needs for its e-paper) would fail to build (display enabled,
+no display device).
+
+**Solution — a per-side override.** ZMK loads a board-name conf in *addition* to
+the shared one, so a new **`config/eyelash_corne_right.conf`** turns the display
+off for the right half only:
+
+```ini
+CONFIG_ZMK_DISPLAY=n
+CONFIG_ZMK_DISPLAY_STATUS_SCREEN_CUSTOM=n
+```
+
+Confirmed from the generated `.config` (no `CONFIG_ZMK_DISPLAY=y` on the right)
+and from the firmware size dropping ~597 KB → ~378 KB, while the left half keeps
+its screen. `CONFIG_INPUT_AZOTEQ_IQS5XX=y`/`CONFIG_I2C=y` remain set on the right.
+
+### 8b — A `build.yaml` entry with **no shield** broke the build-list parser
+
+`from-urob-zmk-config/scripts/zmk_build.sh` built its board and shield lists with
+two **independent** greps, then paired them by index:
+
+```bash
+BOARDS="$(grep '... board:'  build.yaml | sed ...)"   # 4 lines
+SHIELDS="$(grep '... shield:' build.yaml | sed ...)"  # only 3 lines once the right loses its shield
+```
+
+Make the right entry shield-less and the arrays misalign (the right board would
+pair with `settings_reset`, the last board with nothing). Plain word-splitting
+also **drops empty elements**, so an "empty shield" line wouldn't rescue it.
+
+**Solution — parse pairs, preserve blanks, pass the shield as an array:**
+
+```bash
+# Emit exactly one shield per board entry (empty for a display-less board).
+SHIELDS="$(awk '
+  /^[[:space:]]*-[[:space:]]*board:/ { if (seen) print sh; sh=""; seen=1; next }
+  /^[[:space:]]*shield:/ { s=$0; sub(/^[^:]*:[[:space:]]*/,"",s); sh=s }
+  END { if (seen) print sh }
+' build.yaml)"
+
+mapfile -t BOARDS  <<< "$BOARDS"     # mapfile keeps empty lines (word-splitting drops them)
+mapfile -t SHIELDS <<< "$SHIELDS"
+
+# compile_board(): an empty shield contributes no -DSHIELD argument.
+if [[ -n $2 ]]; then SHIELD_OPTS=("-DSHIELD=$2"); else SHIELD_OPTS=(); fi
+west build ... -- ... "${SHIELD_OPTS[@]}" ...
+```
+
+These changes live on the `eyelash_corne_touchpad` branch of
+`from-urob-zmk-config`, so they cannot affect the other variants (each variant is
+a separate branch). A shield-less board's firmware is suffixed `nodisplay`, e.g.
+`eyelash_corne_right_nodisplay-zmk.uf2`.
+
+---
+
 ## The complete fix, file by file
 
 ### `prepare_zmk_build_environment.sh`
@@ -348,6 +636,29 @@ host.
 - Created the branch from `eyelash_corne`.
 - Pinned `config/west.yml` projects to the known-good Zephyr-3.5 commit set
   (Problem 3). Committed (`35172db`) and pushed.
+
+### Touchpad integration (Part II)
+
+- **`config/eyelash_corne.conf`** — `CONFIG_I2C=y` (Problem 5), plus
+  `CONFIG_INPUT`, `CONFIG_INPUT_AZOTEQ_IQS5XX`, `CONFIG_ZMK_POINTING`.
+- **`config/eyelash_corne_right.conf`** (new) — `CONFIG_ZMK_DISPLAY=n` so the
+  right half builds display-less (Problem 8a).
+- **`config/west.yml`** — driver project pointed at the `techcaotri` fork
+  (`feature/zoom-and-swipe`, Problem 6); `mario-peripheral-animation` plus the
+  `gpeye`/`aym1607` remotes removed (Problem 8); the dropped `projects:` key
+  restored (Problem 7).
+- **`build.yaml`** — the `eyelash_corne_right` entry is now shield-less
+  (Problem 8a).
+- **`scripts/zmk_build.sh`** — board/shield list parsed as pairs with `mapfile`,
+  and the shield passed as a bash array so a shield-less board builds (Problem 8b).
+- **`boards/arm/eyelash_corne/*.dts*`** and **`config/base.keymap`** + the forked
+  driver — the touchpad bring-up and the three gestures themselves (see the
+  gestures guide).
+
+### `prepare_zmk_build_environment.sh` (Part II)
+
+- Removed the interim `link_local_iqs5xx_driver` symlink helper; the driver is now
+  pulled as a normal `west` module from the fork (Problem 6).
 
 ---
 
@@ -422,3 +733,18 @@ zephyr_version: 350
 6. **Run automation hermetically.** Use `env -u BASH_ENV bash --noprofile
    --norc <script>` for unattended steps on this host to avoid the `BASH_ENV`/`z`
    startup failure.
+7. **A devicetree node does not enable its bus.** Adding an `&i2c1` node does not
+   set `CONFIG_I2C` unless something `select`s or `default y`s it. When a driver
+   `depends on` a subsystem, enable that subsystem explicitly in `*.conf` — and
+   read the "assigned 'y' but got 'n'" Kconfig warning as "an unmet dependency."
+8. **Consume modules through `west`, not symlinks.** ZMK input drivers add their
+   sources via `zephyr_library_amend()`, which needs a real in-tree module path.
+   Push to a fork and `west update`; a symlink to an out-of-tree copy breaks the
+   module's CMake library ("not built by this project").
+9. **Validate `west.yml` after editing.** `west manifest --validate` followed by
+   `west list` catches a dropped `projects:` key, a mis-indented project, or a bad
+   import in seconds — far faster than a confusing "manifest not available."
+10. **A per-board `.conf` overrides the shared one.** The build loads a
+   board-specific `eyelash_corne_right.conf` in *addition* to the shared
+   `eyelash_corne.conf` (later wins), which is how the right half can drop the
+   display while the left keeps it.
