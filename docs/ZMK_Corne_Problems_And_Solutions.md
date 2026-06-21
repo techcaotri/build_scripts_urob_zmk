@@ -669,10 +669,10 @@ failed boards:
 
 ```text
 output_uf2_eyelash_corne_touchpad/
-├── eyelash_corne_left_nice_epaper-zmk.uf2        657920 B
-├── eyelash_corne_left_nice_epaper_new-zmk.uf2    674304 B
-├── eyelash_corne_left_settings_reset-zmk.uf2     175104 B
-└── eyelash_corne_right_nice_view_custom-zmk.uf2  585216 B
+|-- eyelash_corne_left_nice_epaper-zmk.uf2        657920 B
+|-- eyelash_corne_left_nice_epaper_new-zmk.uf2    674304 B
+|-- eyelash_corne_left_settings_reset-zmk.uf2     175104 B
+`-- eyelash_corne_right_nice_view_custom-zmk.uf2  585216 B
 ```
 
 Cross-checked against the known-good `eyelash_corne` firmware — sizes match to

@@ -240,20 +240,20 @@ workspace plus the symlinks the build expects):
 
 ```text
 <workspace>/
-├── .venv/                     # per-workspace Python virtual environment
-├── .west/                     # west workspace marker
-├── build.yaml   -> from-urob-zmk-config/build.yaml
-├── config/
-│   └── west.yml -> ../from-urob-zmk-config/config/west.yml   # the manifest
-├── from-urob-zmk-config/      # the cloned, variant-specific config repo
-│   ├── boards/                # out-of-tree board definitions
-│   ├── config/                # keymaps, *.conf, combos.dtsi …
-│   ├── build.yaml             # list of board/shield combos to build
-│   └── scripts/zmk_build.sh   # the lower-level builder these scripts call
-├── zmk/                       # ZMK firmware source (the west "app")
-├── zephyr/                    # Zephyr RTOS (version selected by the manifest)
-├── modules/                   # Zephyr/ZMK modules pulled by `west update`
-└── zmk-helpers, zmk-nice-oled, …  # extra modules from the manifest
+|-- .venv/                     # per-workspace Python virtual environment
+|-- .west/                     # west workspace marker
+|-- build.yaml   -> from-urob-zmk-config/build.yaml
+|-- config/
+|   `-- west.yml -> ../from-urob-zmk-config/config/west.yml   # the manifest
+|-- from-urob-zmk-config/      # the cloned, variant-specific config repo
+|   |-- boards/                # out-of-tree board definitions
+|   |-- config/                # keymaps, *.conf, combos.dtsi ...
+|   |-- build.yaml             # list of board/shield combos to build
+|   `-- scripts/zmk_build.sh   # the lower-level builder these scripts call
+|-- zmk/                       # ZMK firmware source (the west "app")
+|-- zephyr/                    # Zephyr RTOS (version selected by the manifest)
+|-- modules/                   # Zephyr/ZMK modules pulled by `west update`
+`-- zmk-helpers, zmk-nice-oled, ...  # extra modules from the manifest
 ```
 
 ---
@@ -270,10 +270,10 @@ For example, the `eyelash_corne_touchpad` build produces:
 
 ```text
 output_uf2_eyelash_corne_touchpad/
-├── eyelash_corne_left_nice_epaper-zmk.uf2
-├── eyelash_corne_left_nice_epaper_new-zmk.uf2
-├── eyelash_corne_left_settings_reset-zmk.uf2
-└── eyelash_corne_right_nice_view_custom-zmk.uf2
+|-- eyelash_corne_left_nice_epaper-zmk.uf2
+|-- eyelash_corne_left_nice_epaper_new-zmk.uf2
+|-- eyelash_corne_left_settings_reset-zmk.uf2
+`-- eyelash_corne_right_nodisplay-zmk.uf2
 ```
 
 ---
