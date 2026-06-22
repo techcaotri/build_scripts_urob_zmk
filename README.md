@@ -80,6 +80,12 @@ need it.
 - **Python** — `python3.9` is the default interpreter for the venv (see the
   `--python` flag and the [reproducibility note](#versioning--reproducibility-important)).
   Newer Zephyr (4.x) requires Python ≥ 3.10; pass `--python python3.12` for those.
+- **A Python virtualenv with `west` + `pyelftools`.** `build_urob_zmk.sh` defaults
+  to a **shared venv one level up from this repo** (`Sources/.venv`) so a single
+  venv serves every keyboard project (override with `-e/--venv`, or fall back to a
+  per-workspace `PATH/.venv`). `prepare_*` still creates a per-workspace `.venv`,
+  but you can delete those and rely on the shared one once it has `west` and
+  `pyelftools` (any `west` ≥ 1.2 supports the `snippet` builds rolio needs).
 - **Zephyr SDK** installed under `~/zephyr_sdk/`. `build_urob_zmk.sh` exports:
   - `ZEPHYR_TOOLCHAIN_VARIANT=zephyr`
   - `ZEPHYR_SDK_INSTALL_DIR=~/zephyr_sdk/`
@@ -183,6 +189,8 @@ build_urob_zmk.sh [-h] [-p PATH] [-o OUTPUT_NAME] [-f] [-l]
 | `-o`, `--output-name` | `NAME` | Output sub-directory name (under this script's directory) for the `.uf2`/`.bin` files. Default: `output_uf2`. Use a per-variant name to avoid clobbering other variants' firmware. |
 | `-f`, `--force` | — | Force a clean rebuild (passes pristine `-p` to `west build`). |
 | `-b`, `--board` | `BOARD` | Build **only** the `build.yaml` entries whose board matches (comma/space separated for several). Each kept entry uses its own shield, so e.g. `-b eyelash_corne_right` builds just the (shield-less) peripheral half. Default: every entry. |
+| `-c`, `--config-dir` | `DIR` | ZMK config repo to build. Default: `PATH/from-urob-zmk-config` (urob layout). Point at a **standard ZMK config** (e.g. `zmk-config-rolio`) to build it via the built-in generic `west build` — no `scripts/zmk_build.sh` needed. See [Building a standard ZMK config](#building-a-standard-zmk-config-eg-zmk-config-rolio). |
+| `-e`, `--venv` | `DIR` | Python virtualenv to activate. Default: the **shared venv one level up from this repo** (`Sources/.venv`), so one venv serves every project; falls back to `PATH/.venv`, then an already-active `$VIRTUAL_ENV`. |
 
 **Testing / logging / tuning** (see [Debugging & serial logging](#debugging--serial-logging) and §9 of the gestures guide):
 
@@ -196,17 +204,23 @@ build_urob_zmk.sh [-h] [-p PATH] [-o OUTPUT_NAME] [-f] [-l]
 
 ### What it does (in order)
 
-1. Activate the workspace `.venv` (from `-p PATH`); abort if no venv is found.
-2. Resolve `SOURCE_DIR`, `CONFIG_DIR` (`…/from-urob-zmk-config`), `ZMK_DIR`
-   (`…/zmk`) and `ZEPHYR_DIR` (`…/zephyr`); read the Zephyr version from
+1. Activate a Python virtualenv. Precedence: `-e/--venv DIR` → the **shared
+   `Sources/.venv`** (one level up from this repo) → `PATH/.venv` → an
+   already-active `$VIRTUAL_ENV`. The shared venv is preferred even when a venv is
+   already active, so the default is deterministic; abort if none is found.
+2. Resolve `SOURCE_DIR`, `CONFIG_DIR` (`-c` or `…/from-urob-zmk-config`),
+   `ZMK_DIR` (`…/zmk`) and `ZEPHYR_DIR` (`…/zephyr`); read the Zephyr version from
    `zephyr/VERSION`.
 3. **Export `ZEPHYR_BASE=$ZEPHYR_DIR`** — pins `find_package(Zephyr)` to *this*
    workspace's Zephyr so the shared `~/.cmake/packages/Zephyr` registry can't
    accidentally resolve to a different variant's Zephyr.
-4. Unless `--monitor-only`: `west zephyr-export`, then invoke
-   `from-urob-zmk-config/scripts/zmk_build.sh -l` with the host config/zmk dirs
-   and (optionally) `-p` for force, `-S zmk-usb-logging` for logging, and
-   `-b BOARD` to filter the build list.
+4. Unless `--monitor-only`, `west zephyr-export`, then build:
+   - **urob layout** (config dir has `scripts/zmk_build.sh`): delegate to it with
+     the host config/zmk dirs, `-p` for force, `-S zmk-usb-logging` for logging,
+     and `-b BOARD` to filter.
+   - **standard ZMK config** (no `scripts/zmk_build.sh`, e.g. `zmk-config-rolio`):
+     parse `build.yaml` directly and run `west build` per entry, honoring its
+     `shield:`, `snippet:` and `cmake-args:` (and `-DZMK_CONFIG`/`-DZMK_EXTRA_MODULES`).
 5. Copy each built `zmk.uf2`/`zmk.bin` into
    `./<output-name>/<board>_<shield>-zmk.uf2`, backing up any previous file to
    `*.bak`. A shield-less board uses the suffix `nodisplay`.
@@ -229,7 +243,52 @@ build_urob_zmk.sh [-h] [-p PATH] [-o OUTPUT_NAME] [-f] [-l]
 
 # Re-open the serial monitor on an already-flashed board (no build)
 ./build_urob_zmk.sh -p ~/kb/eyelash_tp --monitor-only --monitor-device /dev/ttyACM0
+
+# Build a standard ZMK config (zmk-config-rolio) from its own workspace, shared venv
+./build_urob_zmk.sh -p source_rolio -c ../Eyelash-Corne-Touchpad/zmk-config-rolio \
+    -o output_uf2_rolio -f
 ```
+
+### Building a standard ZMK config (e.g. `zmk-config-rolio`)
+
+`build_urob_zmk.sh` is not limited to urob configs. With `-c/--config-dir` it can
+build any **standard ZMK config** — a repo with `config/west.yml`, `build.yaml`,
+and (optionally) a `boards/` module — even though such a repo ships no
+`scripts/zmk_build.sh`. The script falls back to a built-in generic `west build`
+loop that honors each `build.yaml` entry's `shield:`, `snippet:` and `cmake-args:`.
+
+The config repo (e.g. `zmk-config-rolio`) is **not** itself a prepared west
+workspace, so set one up once (same pattern `prepare_*` uses — a `config/` dir
+whose `west.yml` is symlinked from the config repo, then `west init -l config` +
+`west update`):
+
+```bash
+ROLIO=.../Eyelash-Corne-Touchpad/zmk-config-rolio          # the config repo
+WS=.../Eyelash-Corne-Touchpad/source_rolio                 # the west workspace
+
+mkdir -p "$WS/config" && ln -sf "$ROLIO/config/west.yml" "$WS/config/west.yml"
+( cd "$WS" \
+  && source /path/to/Sources/.venv/bin/activate \
+  && west init -l config && west update && west zephyr-export \
+  && pip install -r zephyr/scripts/requirements.txt )
+
+# Then build (the shared Sources/.venv is the default venv):
+./build_urob_zmk.sh -p "$WS" -c "$ROLIO" -o output_uf2_rolio -f
+```
+
+This produces, in `output_uf2_rolio/`:
+
+```text
+nice_nano_v2_sofle_left-zmk.uf2        (central + nice_oled + ZMK Studio)
+nice_nano_v2_sofle_right-zmk.uf2       (peripheral + nice_oled + IQS5xx touchpad)
+nice_nano_v2_settings_reset-zmk.uf2
+```
+
+> `zmk-config-rolio` pins `zmk@v0.2`, which imports the same **Zephyr
+> v3.5.0+zmk-fixes** the eyelash variant uses, so the same SDK 0.16.3 and Python
+> 3.9 (the shared venv) build it. Its `sofle_left` entry needs the
+> `studio-rpc-usb-uart` snippet (it sets `CONFIG_ZMK_STUDIO=y`), which the generic
+> builder applies automatically.
 
 ---
 

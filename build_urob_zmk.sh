@@ -28,6 +28,15 @@ error() {
 	echo -e "${RED}$@${NOCOLOR}" >&2
 }
 
+# The shared Python virtualenv lives one level above this script's repository
+# (e.g. .../Sources/.venv) and is reused across keyboard projects. Resolve
+# symlinks first so this holds whether the script is run directly or via a
+# symlink elsewhere (e.g. Eyelash-Corne-Touchpad/build_urob_zmk.sh). Override
+# with -e/--venv.
+_real_script="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)"
+[ -z "$_real_script" ] && _real_script="${BASH_SOURCE[0]}"
+DEFAULT_VENV="$(cd -- "$(dirname -- "$_real_script")/.." &>/dev/null && pwd)/.venv"
+
 # Open a serial monitor on the keyboard's USB-CDC console (the half built with the
 # zmk-usb-logging snippet, see -l). Used to watch the IQS5xx driver's LOG_INF /
 # LOG_ERR output while testing and tuning gestures (gestures guide section 9).
@@ -75,12 +84,99 @@ monitor_serial() {
 	fi
 }
 
+# Build a *standard* ZMK config that does NOT ship from-urob-zmk-config/scripts/
+# zmk_build.sh (e.g. zmk-config-rolio: a config/ + build.yaml + a boards/ module).
+# Mirrors, inline, the `west build` invocation the urob zmk_build.sh would make.
+# Uses globals: SOURCE_DIR, CONFIG_DIR, ZMK_DIR, output_dir, force, zmk_logging, board.
+compile_firmware_generic() {
+	local build_yaml="$CONFIG_DIR/build.yaml"
+	if [ ! -f "$build_yaml" ]; then
+		error "No build.yaml found at $build_yaml"
+		return 1
+	fi
+
+	# Parse the build.yaml include list into index-aligned arrays. For every
+	# "- board:" entry emit exactly one value of board / shield / snippet /
+	# cmake-args (empty when the field is absent), read with mapfile so blank
+	# values survive as array elements (plain word-splitting would drop them).
+	_byfield() {
+		awk -v key="$1" '
+			/^[[:space:]]*-[[:space:]]*board:/ { if (seen) print v; v=""; seen=1; next }
+			$0 ~ ("^[[:space:]]*" key ":") { s=$0; sub(/^[^:]*:[[:space:]]*/,"",s); v=s }
+			END { if (seen) print v }
+		' "$build_yaml"
+	}
+	local boards_str shields_str snippets_str cmakeargs_str
+	boards_str="$(grep -E '^[[:space:]]*-[[:space:]]*board:' "$build_yaml" | sed 's/^.*: *//')"
+	shields_str="$(_byfield shield)"
+	snippets_str="$(_byfield snippet)"
+	cmakeargs_str="$(_byfield cmake-args)"
+	local BOARDS SHIELDS SNIPPETS CMAKEARGS
+	mapfile -t BOARDS <<< "$boards_str"
+	mapfile -t SHIELDS <<< "$shields_str"
+	mapfile -t SNIPPETS <<< "$snippets_str"
+	mapfile -t CMAKEARGS <<< "$cmakeargs_str"
+
+	local pristine=""
+	[ "$force" = true ] && pristine="-p"
+
+	cd "$SOURCE_DIR" || return 1
+	local i ok=0 total=0
+	for ((i = 0; i < ${#BOARDS[@]}; i++)); do
+		local bd="${BOARDS[i]}" sh="${SHIELDS[i]}"
+		[ -z "$bd" ] && continue
+		# Optional -b board filter.
+		if [ -n "$board" ]; then
+			case " ${board//,/ } " in *" $bd "*) ;; *) continue ;; esac
+		fi
+		total=$((total + 1))
+		local shield_opts=() suffix
+		if [ -n "$sh" ]; then
+			shield_opts=("-DSHIELD=$sh")
+			suffix=$(echo "$sh" | awk '{print $1}')
+		else
+			suffix="nodisplay"
+		fi
+		# Per-entry snippets (build.yaml `snippet:` plus -l logging) and cmake-args
+		# (e.g. studio-rpc-usb-uart, which provides the zmk,studio-rpc-uart node).
+		local snippet_opts=() extra_cmake=()
+		[ "$zmk_logging" = true ] && snippet_opts+=(-S zmk-usb-logging)
+		[ -n "${SNIPPETS[i]}" ] && snippet_opts+=(-S "${SNIPPETS[i]}")
+		[ -n "${CMAKEARGS[i]}" ] && read -r -a extra_cmake <<< "${CMAKEARGS[i]}"
+		local bdir="$ZMK_DIR/app/build/${bd}_${suffix}"
+		info "Building $bd ${sh:-(no shield)}${SNIPPETS[i]:+ [snippet: ${SNIPPETS[i]}]} ..."
+		# shellcheck disable=SC2086
+		if west build $pristine -s "$ZMK_DIR/app" -d "$bdir" -b "$bd" "${snippet_opts[@]}" \
+			-- -DZMK_CONFIG="$CONFIG_DIR/config" "${shield_opts[@]}" "${extra_cmake[@]}" \
+			-DZMK_EXTRA_MODULES="$CONFIG_DIR" -Wno-dev; then
+			local type=bin
+			[ -f "$bdir/zephyr/zmk.uf2" ] && type=uf2
+			local out="$output_dir/${bd}_${suffix}-zmk.$type"
+			[ -f "$out" ] && [ ! -L "$out" ] && mv "$out" "$out.bak"
+			cp "$bdir/zephyr/zmk.$type" "$out"
+			info "  -> $out"
+			ok=$((ok + 1))
+		else
+			error "  build FAILED for $bd ${sh:-(no shield)}"
+		fi
+	done
+	info "Generic ZMK build: $ok/$total board(s) succeeded -> $output_dir"
+	[ "$ok" -eq "$total" ] && [ "$total" -gt 0 ]
+}
+
 compile_firmware() {
 	SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 	info "SCRIPT_DIR: $SCRIPT_DIR"
 	SOURCE_DIR=$(realpath "$1")
 	info "SOURCE_DIR: $SOURCE_DIR"
-	CONFIG_DIR="$(realpath "$1")/from-urob-zmk-config"
+	# CONFIG_DIR is the ZMK config repo. Default to the urob layout
+	# ($SOURCE_DIR/from-urob-zmk-config); override with -c/--config-dir for a
+	# standard ZMK config that lives elsewhere (e.g. zmk-config-rolio).
+	if [ -n "$config_dir" ]; then
+		CONFIG_DIR="$(realpath "$config_dir")"
+	else
+		CONFIG_DIR="$SOURCE_DIR/from-urob-zmk-config"
+	fi
 	info "CONFIG_DIR: $CONFIG_DIR"
 	ZMK_DIR="$SOURCE_DIR/zmk"
 	info "ZMK_DIR: $ZMK_DIR"
@@ -136,15 +232,22 @@ compile_firmware() {
 		info "board filter: $board"
 	fi
 
-	OPTIONS=" -l -o "$output_dir" --host-config-dir "$CONFIG_DIR" --host-zmk-dir "$ZMK_DIR" $board_opt $WEST_OPTS"
-
 	pushd .
 	cd "$SOURCE_DIR" || exit
   west zephyr-export
   popd || exit
 
-	echo "$CONFIG_DIR"/scripts/zmk_build.sh "$OPTIONS"
-	"$CONFIG_DIR"/scripts/zmk_build.sh $OPTIONS
+	if [ -x "$CONFIG_DIR/scripts/zmk_build.sh" ]; then
+		# urob layout: delegate to the config repo's lower-level builder.
+		OPTIONS=" -l -o "$output_dir" --host-config-dir "$CONFIG_DIR" --host-zmk-dir "$ZMK_DIR" $board_opt $WEST_OPTS"
+		echo "$CONFIG_DIR"/scripts/zmk_build.sh "$OPTIONS"
+		"$CONFIG_DIR"/scripts/zmk_build.sh $OPTIONS
+	else
+		# Standard ZMK config without scripts/zmk_build.sh (e.g. zmk-config-rolio):
+		# build each build.yaml entry directly with west.
+		info "No $CONFIG_DIR/scripts/zmk_build.sh -> using the built-in generic ZMK build."
+		compile_firmware_generic
+	fi
 }
 
 usage() {
@@ -157,6 +260,12 @@ usage() {
 	echo -e ${CYAN} "  -f, --force           Force a clean (pristine) rebuild"${NOCOLOR}
 	echo -e ${CYAN} "  -b, --board BOARD     Build only build.yaml entries for this board (e.g. eyelash_corne_right)."${NOCOLOR}
 	echo -e ${CYAN} "                        Comma/space separated for several. Default: every entry in build.yaml."${NOCOLOR}
+	echo -e ${CYAN} "  -c, --config-dir DIR  ZMK config repo to build. Default: PATH/from-urob-zmk-config (urob layout)."${NOCOLOR}
+	echo -e ${CYAN} "                        Point at a standard ZMK config (e.g. zmk-config-rolio) to build it via"${NOCOLOR}
+	echo -e ${CYAN} "                        the built-in generic west build (no scripts/zmk_build.sh needed)."${NOCOLOR}
+	echo -e ${CYAN} "  -e, --venv DIR        Python virtualenv to activate. Default: the shared venv next to this"${NOCOLOR}
+	echo -e ${CYAN} "                        script's repo ($DEFAULT_VENV);"${NOCOLOR}
+	echo -e ${CYAN} "                        falls back to an active \$VIRTUAL_ENV, then PATH/.venv."${NOCOLOR}
 	echo
 	echo -e ${CYAN} "Testing / logging / tuning (see the gestures guide, section 9):"${NOCOLOR}
 	echo -e ${CYAN} "  -l, --zmk-logging     Build with the zmk-usb-logging snippet (USB-CDC serial console for LOG_INF/LOG_ERR)."${NOCOLOR}
@@ -172,6 +281,8 @@ usage() {
 	echo -e ${CYAN} "  $0 -p WS -o out_tp -b eyelash_corne_right -l -f -m"${NOCOLOR}
 	echo -e ${CYAN} "  # Just re-open the serial monitor (firmware already flashed):"${NOCOLOR}
 	echo -e ${CYAN} "  $0 -p WS --monitor-only"${NOCOLOR}
+	echo -e ${CYAN} "  # Build a standard ZMK config (zmk-config-rolio) from its own workspace:"${NOCOLOR}
+	echo -e ${CYAN} "  $0 -p source_rolio -c ../Eyelash-Corne-Touchpad/zmk-config-rolio -o output_uf2_rolio -f"${NOCOLOR}
 	exit 1
 }
 
@@ -179,6 +290,8 @@ force=false
 zmk_logging=false
 output_name="output_uf2"
 board=""
+config_dir=""
+venv_dir=""
 monitor=false
 monitor_only=false
 monitor_device=""
@@ -205,6 +318,16 @@ while [[ $# -gt 0 ]]; do
 		;;
 	-b | --board)
 		board="$2"
+		shift # past argument
+		shift # past value
+		;;
+	-c | --config-dir)
+		config_dir="$2"
+		shift # past argument
+		shift # past value
+		;;
+	-e | --venv)
+		venv_dir="$2"
 		shift # past argument
 		shift # past value
 		;;
@@ -242,26 +365,42 @@ if [[ -z "$path" ]]; then
 	exit 1
 fi
 
-pushd .
-cd "$path" || exit
-if [ -d .venv ]; then
-  info "Found .venv directory at $(pwd)/.venv . Activating this Python virtual environment..."
-  source .venv/bin/activate
-  info "$(which python)"
-	if [[ -z "$VIRTUAL_ENV" ]]; then
-		error "Python virtual environment not detected."
-		exit 1
-	else
-		info "Running inside a Python virtual environment."
-	fi
-else
-  if [[ -z "$VIRTUAL_ENV" ]]; then
-		error "Neither .venv directory found nor Python virtual environment not detected. Please run prepare_zmk_build_environment.sh first."
-    exit 1
-  fi
+# Resolve the Python virtualenv to activate. Precedence:
+#   1. -e/--venv DIR (explicit)
+#   2. the shared venv next to this script's repo ($DEFAULT_VENV, e.g. Sources/.venv)
+#   3. the per-workspace $path/.venv (legacy)
+#   4. an already-active $VIRTUAL_ENV (only if none of the above exist)
+# The shared venv is preferred even when some venv is already active in the shell,
+# so the default is deterministic; pass -e/--venv to force a specific one.
+venv=""
+if [ -n "$venv_dir" ]; then
+	venv="$venv_dir"
+elif [ -f "$DEFAULT_VENV/bin/activate" ]; then
+	venv="$DEFAULT_VENV"
+elif [ -f "$path/.venv/bin/activate" ]; then
+	venv="$path/.venv"
 fi
 
-popd || exit
+if [ -n "$venv" ]; then
+	if [ ! -f "$venv/bin/activate" ]; then
+		error "Virtualenv has no bin/activate: $venv"
+		exit 1
+	fi
+	info "Activating Python virtual environment: $venv"
+	# shellcheck disable=SC1091
+	source "$venv/bin/activate"
+	info "$(command -v python)"
+	if [ -z "$VIRTUAL_ENV" ]; then
+		error "Failed to activate the virtual environment at $venv."
+		exit 1
+	fi
+elif [ -n "$VIRTUAL_ENV" ]; then
+	info "Using already-active virtual environment: $VIRTUAL_ENV"
+else
+	error "No Python virtualenv found. Pass -e/--venv DIR, create $DEFAULT_VENV,"
+	error "or run prepare_zmk_build_environment.sh for $path."
+	exit 1
+fi
 echo "force: $force"
 
 export ZEPHYR_TOOLCHAIN_VARIANT=zephyr
