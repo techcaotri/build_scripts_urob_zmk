@@ -135,20 +135,24 @@ compile_firmware_generic() {
 			case " ${board//,/ } " in *" $bd "*) ;; *) continue ;; esac
 		fi
 		total=$((total + 1))
-		local shield_opts=() suffix
+		local shield_opts=() suffix bdir_key
 		if [ -n "$sh" ]; then
 			shield_opts=("-DSHIELD=$sh")
-			suffix=$(echo "$sh" | awk '{print $1}')
+			suffix=$(echo "$sh" | awk '{print $1}')      # first shield word (output-name fallback)
+			bdir_key=$(echo "$sh" | tr ' ' '_')          # full shield -> distinct build dir
 		else
-			suffix="nodisplay"
+			suffix="nodisplay"; bdir_key="nodisplay"
 		fi
+		# Prefer the artifact-name for the build dir so entries sharing a first shield
+		# word (e.g. two "sofle_left ..." display variants) don't collide on one dir.
+		[ -n "${ARTIFACTS[i]}" ] && bdir_key="${ARTIFACTS[i]}"
 		# Per-entry snippets (build.yaml `snippet:` plus -l logging) and cmake-args
 		# (e.g. studio-rpc-usb-uart, which provides the zmk,studio-rpc-uart node).
 		local snippet_opts=() extra_cmake=()
 		[ "$zmk_logging" = true ] && snippet_opts+=(-S zmk-usb-logging)
 		[ -n "${SNIPPETS[i]}" ] && snippet_opts+=(-S "${SNIPPETS[i]}")
 		[ -n "${CMAKEARGS[i]}" ] && read -r -a extra_cmake <<< "${CMAKEARGS[i]}"
-		local bdir="$ZMK_DIR/app/build/${bd}_${suffix}"
+		local bdir="$ZMK_DIR/app/build/${bd}_${bdir_key}"
 		info "Building $bd ${sh:-(no shield)}${SNIPPETS[i]:+ [snippet: ${SNIPPETS[i]}]} ..."
 		# shellcheck disable=SC2086
 		if west build $pristine -s "$ZMK_DIR/app" -d "$bdir" -b "$bd" "${snippet_opts[@]}" \
