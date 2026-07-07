@@ -190,6 +190,8 @@ build_urob_zmk.sh [-h] [-p PATH] [-o OUTPUT_NAME] [-f] [-l]
 | `-f`, `--force` | — | Force a clean rebuild (passes pristine `-p` to `west build`). |
 | `-b`, `--board` | `BOARD` | Build **only** the `build.yaml` entries whose board matches (comma/space separated for several). Each kept entry uses its own shield, so e.g. `-b eyelash_corne_right` builds just the (shield-less) peripheral half. Default: every entry. |
 | `-c`, `--config-dir` | `DIR` | ZMK config repo to build. Default: `PATH/from-urob-zmk-config` (urob layout). Point at a **standard ZMK config** (e.g. `zmk-config-rolio`) to build it via the built-in generic `west build` — no `scripts/zmk_build.sh` needed. See [Building a standard ZMK config](#building-a-standard-zmk-config-eg-zmk-config-rolio). |
+| `--rolio` | `[BRANCH]` | **Shortcut for the bundled `zmk-config-rolio`**: check out `BRANCH` (default `tps65-oled`), then build it from `source_rolio`. Sets `-p`/`-c`/`-o` for you; output → `output_uf2_rolio-<branch>`. Any other flag (`-f`, `-b`, `-l`, …) still applies. Merged from the old `build_rolio.sh`. |
+| `--rolio-dir` | `DIR` | Directory holding `zmk-config-rolio` + `source_rolio`. Default: auto-detect `Eyelash-Corne-Touchpad` (next to this script or the current dir). Only needed if auto-detect fails. |
 | `-e`, `--venv` | `DIR` | Python virtualenv to activate. Default: the **shared venv one level up from this repo** (`Sources/.venv`), so one venv serves every project; falls back to `PATH/.venv`, then an already-active `$VIRTUAL_ENV`. |
 
 **Testing / logging / tuning** (see [Debugging & serial logging](#debugging--serial-logging) and §9 of the gestures guide):
@@ -247,6 +249,10 @@ build_urob_zmk.sh [-h] [-p PATH] [-o OUTPUT_NAME] [-f] [-l]
 # Build a standard ZMK config (zmk-config-rolio) from its own workspace, shared venv
 ./build_urob_zmk.sh -p source_rolio -c ../Eyelash-Corne-Touchpad/zmk-config-rolio \
     -o output_uf2_rolio -f
+
+# Same, the easy way: check out + build the rolio tps65-oled branch in one step
+./build_urob_zmk.sh --rolio -f            # -> output_uf2_rolio-tps65-oled/
+./build_urob_zmk.sh --rolio master -f     # a different branch -> output_uf2_rolio-master/
 ```
 
 ### Building a standard ZMK config (e.g. `zmk-config-rolio`)
@@ -256,6 +262,12 @@ build any **standard ZMK config** — a repo with `config/west.yml`, `build.yaml
 and (optionally) a `boards/` module — even though such a repo ships no
 `scripts/zmk_build.sh`. The script falls back to a built-in generic `west build`
 loop that honors each `build.yaml` entry's `shield:`, `snippet:` and `cmake-args:`.
+
+> **Shortcut for the bundled rolio:** for `zmk-config-rolio` specifically you don't
+> need to spell out `-p`/`-c`/`-o` — use **`--rolio [branch]`** (default `tps65-oled`),
+> which also switches the config checkout to that branch first and writes to
+> `output_uf2_rolio-<branch>/`. The manual form below is what it automates (and what to
+> use for *any other* standard config).
 
 The config repo (e.g. `zmk-config-rolio`) is **not** itself a prepared west
 workspace, so set one up once (same pattern `prepare_*` uses — a `config/` dir

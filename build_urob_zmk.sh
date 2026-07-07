@@ -280,6 +280,14 @@ usage() {
 	echo -e ${CYAN} "                        script's repo ($DEFAULT_VENV);"${NOCOLOR}
 	echo -e ${CYAN} "                        falls back to an active \$VIRTUAL_ENV, then PATH/.venv."${NOCOLOR}
 	echo
+	echo -e ${CYAN} "Reference (zmk-config-rolio) shortcut — merged from build_rolio.sh:"${NOCOLOR}
+	echo -e ${CYAN} "  --rolio [BRANCH]      Switch the bundled zmk-config-rolio checkout to BRANCH (default"${NOCOLOR}
+	echo -e ${CYAN} "                        tps65-oled) and build it from its own source_rolio workspace. Sets -p,"${NOCOLOR}
+	echo -e ${CYAN} "                        -c and -o for you; output defaults to output_uf2_rolio-<branch>"${NOCOLOR}
+	echo -e ${CYAN} "                        (e.g. output_uf2_rolio-tps65-oled). -o/-p/-c still override."${NOCOLOR}
+	echo -e ${CYAN} "  --rolio-dir DIR       Directory holding zmk-config-rolio + source_rolio (default: auto-detect"${NOCOLOR}
+	echo -e ${CYAN} "                        Eyelash-Corne-Touchpad next to this script, or the current directory)."${NOCOLOR}
+	echo
 	echo -e ${CYAN} "Testing / logging / tuning (see the gestures guide, section 9):"${NOCOLOR}
 	echo -e ${CYAN} "  -l, --zmk-logging     Build with the zmk-usb-logging snippet (USB-CDC serial console for LOG_INF/LOG_ERR)."${NOCOLOR}
 	echo -e ${CYAN} "  -m, --monitor         After building, open a serial monitor on the logging half's USB-CDC device."${NOCOLOR}
@@ -296,12 +304,18 @@ usage() {
 	echo -e ${CYAN} "  $0 -p WS --monitor-only"${NOCOLOR}
 	echo -e ${CYAN} "  # Build a standard ZMK config (zmk-config-rolio) from its own workspace:"${NOCOLOR}
 	echo -e ${CYAN} "  $0 -p source_rolio -c ../Eyelash-Corne-Touchpad/zmk-config-rolio -o output_uf2_rolio -f"${NOCOLOR}
+	echo -e ${CYAN} "  # Same, the easy way — build the rolio tps65-oled branch -> output_uf2_rolio-tps65-oled:"${NOCOLOR}
+	echo -e ${CYAN} "  $0 --rolio -f"${NOCOLOR}
+	echo -e ${CYAN} "  # Build a different rolio branch (-> output_uf2_rolio-master):"${NOCOLOR}
+	echo -e ${CYAN} "  $0 --rolio master -f"${NOCOLOR}
 	exit 1
 }
 
 force=false
 zmk_logging=false
 output_name="output_uf2"
+output_name_set=false
+path=""
 board=""
 config_dir=""
 venv_dir=""
@@ -309,6 +323,12 @@ monitor=false
 monitor_only=false
 monitor_device=""
 baud=115200
+# --rolio convenience mode (folded in from build_rolio.sh): switch the bundled
+# zmk-config-rolio checkout to a branch and build it from its own source_rolio
+# workspace. rolio_dir holds zmk-config-rolio + source_rolio (auto-detected).
+rolio_mode=false
+rolio_branch=""
+rolio_dir=""
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	-h | --help)
@@ -322,8 +342,27 @@ while [[ $# -gt 0 ]]; do
 		;;
 	-o | --output-name)
 		output_name="$2"
+		output_name_set=true
 		shift # past argument
 		shift # past value
+		;;
+	--rolio)
+		# --rolio [BRANCH]: build the bundled zmk-config-rolio. An optional branch
+		# name may follow (default tps65-oled); anything starting with '-' is left
+		# for the normal parser (e.g. `--rolio -f`, `--rolio master -f`).
+		rolio_mode=true
+		if [[ -n "${2:-}" && "$2" != -* ]]; then
+			rolio_branch="$2"
+			shift
+		fi
+		shift
+		;;
+	--rolio-dir)
+		# Directory that holds zmk-config-rolio + source_rolio (default: auto-detect
+		# Eyelash-Corne-Touchpad next to this script, or the current directory).
+		rolio_dir="$2"
+		shift
+		shift
 		;;
 	-f | --force)
 		force=true
@@ -372,6 +411,50 @@ while [[ $# -gt 0 ]]; do
 		;;
 	esac
 done
+
+# --- rolio convenience mode (merged from build_rolio.sh) ----------------------
+# --rolio [BRANCH] switches the bundled zmk-config-rolio checkout to BRANCH
+# (default tps65-oled) and builds it from its own source_rolio workspace, with
+# the generic west build. Output defaults to output_uf2_rolio-<branch>
+# (e.g. output_uf2_rolio-tps65-oled), overridable with -o.
+if [ "$rolio_mode" = true ]; then
+	[ -z "$rolio_branch" ] && rolio_branch="tps65-oled"
+
+	# Locate the directory holding zmk-config-rolio + source_rolio.
+	if [ -z "$rolio_dir" ]; then
+		_scriptdir_real="$(dirname -- "$_real_script")"
+		if [ -d "$PWD/zmk-config-rolio/.git" ]; then
+			rolio_dir="$PWD"
+		elif [ -d "$_scriptdir_real/../Eyelash-Corne-Touchpad/zmk-config-rolio/.git" ]; then
+			rolio_dir="$(cd -- "$_scriptdir_real/../Eyelash-Corne-Touchpad" &>/dev/null && pwd)"
+		else
+			error "Cannot locate zmk-config-rolio. Pass --rolio-dir DIR (the directory"
+			error "holding zmk-config-rolio + source_rolio), or run from Eyelash-Corne-Touchpad/."
+			exit 1
+		fi
+	fi
+	ROLIO_CFG="$rolio_dir/zmk-config-rolio"
+	ROLIO_WS="$rolio_dir/source_rolio"
+	[ -d "$ROLIO_CFG/.git" ] || { error "zmk-config-rolio not found at $ROLIO_CFG. Run ./setup_projects.sh first."; exit 1; }
+	[ -e "$ROLIO_WS/zmk/app/west.yml" ] || { error "rolio workspace not prepared at $ROLIO_WS. Run ./setup_projects.sh first."; exit 1; }
+
+	# Switch the config checkout to the requested branch (local or origin).
+	info "==> rolio config branch: $rolio_branch"
+	git -C "$ROLIO_CFG" fetch --quiet origin "$rolio_branch" 2>/dev/null || true
+	if git -C "$ROLIO_CFG" show-ref --verify --quiet "refs/heads/$rolio_branch"; then
+		git -C "$ROLIO_CFG" checkout -q "$rolio_branch" || { error "checkout $rolio_branch failed"; exit 1; }
+	elif git -C "$ROLIO_CFG" show-ref --verify --quiet "refs/remotes/origin/$rolio_branch"; then
+		git -C "$ROLIO_CFG" checkout -q -b "$rolio_branch" "origin/$rolio_branch" || { error "checkout origin/$rolio_branch failed"; exit 1; }
+	else
+		error "branch '$rolio_branch' not found locally or on origin."; exit 1
+	fi
+	info "    on $(git -C "$ROLIO_CFG" branch --show-current) @ $(git -C "$ROLIO_CFG" log --oneline -1)"
+
+	# Derive path / config-dir / output-name unless the user set them explicitly.
+	[ -z "$path" ] && path="$ROLIO_WS"
+	[ -z "$config_dir" ] && config_dir="$ROLIO_CFG"
+	[ "$output_name_set" = false ] && output_name="output_uf2_rolio-$rolio_branch"
+fi
 
 if [[ -z "$path" ]]; then
 	error "No path specified. Use -p or --path to specify a path."
@@ -423,6 +506,13 @@ if [ "$monitor_only" = true ]; then
 	info "Skipping build (--monitor-only)."
 else
 	compile_firmware "$path" $force "$zmk_logging" "$output_name"
+	# List the produced firmware (build_rolio.sh used to do this; keep it for --rolio
+	# and any build so the user sees exactly what/where the .uf2 files are).
+	_outdir_final="$(cd -- "$(dirname -- "$_real_script")" &>/dev/null && pwd)/$output_name"
+	if [ -d "$_outdir_final" ]; then
+		info "==> firmware in $_outdir_final :"
+		ls -1 "$_outdir_final"/*.uf2 "$_outdir_final"/*.bin 2>/dev/null | sed 's#.*/#    #' || echo "    (none?)"
+	fi
 fi
 
 if [ "$monitor" = true ] || [ "$monitor_only" = true ]; then
