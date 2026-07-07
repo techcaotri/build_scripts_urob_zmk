@@ -106,16 +106,21 @@ compile_firmware_generic() {
 			END { if (seen) print v }
 		' "$build_yaml"
 	}
-	local boards_str shields_str snippets_str cmakeargs_str
+	local boards_str shields_str snippets_str cmakeargs_str artifactnames_str
 	boards_str="$(grep -E '^[[:space:]]*-[[:space:]]*board:' "$build_yaml" | sed 's/^.*: *//')"
 	shields_str="$(_byfield shield)"
 	snippets_str="$(_byfield snippet)"
 	cmakeargs_str="$(_byfield cmake-args)"
-	local BOARDS SHIELDS SNIPPETS CMAKEARGS
+	# artifact-name (optional): the GitHub-Actions output name. When present it is
+	# used verbatim as the firmware filename (e.g. nice_sofle_right_touchpad),
+	# which is clearer than the board_shield fallback for multi-shield entries.
+	artifactnames_str="$(_byfield artifact-name)"
+	local BOARDS SHIELDS SNIPPETS CMAKEARGS ARTIFACTS
 	mapfile -t BOARDS <<< "$boards_str"
 	mapfile -t SHIELDS <<< "$shields_str"
 	mapfile -t SNIPPETS <<< "$snippets_str"
 	mapfile -t CMAKEARGS <<< "$cmakeargs_str"
+	mapfile -t ARTIFACTS <<< "$artifactnames_str"
 
 	local pristine=""
 	[ "$force" = true ] && pristine="-p"
@@ -151,7 +156,11 @@ compile_firmware_generic() {
 			-DZMK_EXTRA_MODULES="$CONFIG_DIR" -Wno-dev; then
 			local type=bin
 			[ -f "$bdir/zephyr/zmk.uf2" ] && type=uf2
-			local out="$output_dir/${bd}_${suffix}-zmk.$type"
+			# Output filename: prefer the build.yaml `artifact-name:` (e.g.
+			# nice_sofle_right_touchpad); otherwise fall back to <board>_<shield>-zmk.
+			local outbase="${bd}_${suffix}-zmk"
+			[ -n "${ARTIFACTS[i]}" ] && outbase="${ARTIFACTS[i]}"
+			local out="$output_dir/${outbase}.$type"
 			[ -f "$out" ] && [ ! -L "$out" ] && mv "$out" "$out.bak"
 			cp "$bdir/zephyr/zmk.$type" "$out"
 			info "  -> $out"

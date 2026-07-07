@@ -325,14 +325,14 @@ workspace plus the symlinks the build expects):
   before copying the fresh one.
 - Per-board build logs are written to `/tmp/zmk_build_<board>.log`.
 
-For example, the `eyelash_corne_touchpad` build produces:
+For example, the `eyelash_corne_touchpad` build produces (filenames from each
+`build.yaml` entry's `artifact-name:`):
 
 ```text
 output_uf2_eyelash_corne_touchpad/
-|-- eyelash_corne_left_nice_epaper-zmk.uf2
-|-- eyelash_corne_left_nice_epaper_new-zmk.uf2
-|-- eyelash_corne_left_settings_reset-zmk.uf2
-`-- eyelash_corne_right_nodisplay-zmk.uf2
+|-- eyelash_corne_left_vista508.uf2       # central + vista508 LS0xx display
+|-- eyelash_corne_right_touchpad.uf2      # peripheral + TPS65 touchpad (I2C0)
+`-- eyelash_corne_settings_reset.uf2      # settings wipe
 ```
 
 ---
