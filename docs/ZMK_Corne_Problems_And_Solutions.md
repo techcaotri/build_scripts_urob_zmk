@@ -861,6 +861,68 @@ runs cleanly — confirmed on hardware.
 > reads inside the chip's data-ready window (the Azoteq part NACKs reads issued outside
 > it), or add I²C bus-recovery. That is a change to the `zmk-driver-azoteq-iqs5xx` fork.
 
+## Problem 14 — OLED dies after a long idle and only a settings-reset revives it
+
+### Symptom
+
+Different from Problem 12 (which was a 30 s idle *blank*). Here the OLED stays on through
+normal use and idle, but after a **long** wait (~1 h in the original config) it goes dark
+and **will not come back** on keypress, on wake, or on re-flashing the firmware — the
+*only* thing that revives it is flashing `settings_reset` and then the OLED firmware.
+
+### Investigation
+
+The "needs a settings-reset" part is the tell: something **persisted in flash** is holding
+the display off across a reboot (a plain re-flash boots the same way and doesn't fix it;
+only clearing saved settings does). A fast-repro debug build (`CONFIG_ZMK_IDLE_SLEEP_TIMEOUT`
+= 30 s, USB logging, plus temporary instrumentation in `activity.c`/`ext_power_generic.c`
+to log ext-power state and to deep-sleep even on USB) showed the OLED **recovering** every
+sleep/wake — because 30 s is far below the 10 min idle timeout. That mismatch localized the
+trigger to the **idle** path, not deep sleep itself.
+
+### Root cause
+
+The OLED shares the **EXT_POWER** rail (nice_nano_v2 switched VCC, P0.13) with the WS2812
+underglow. The config enabled RGB underglow (`CONFIG_ZMK_RGB_UNDERGLOW=y`,
+`CONFIG_ZMK_RGB_UNDERGLOW_AUTO_OFF_IDLE=y`) **for LEDs this hardware does not have**, and
+`CONFIG_ZMK_RGB_UNDERGLOW_EXT_POWER` defaults `y`. So:
+
+1. At the 10-min idle mark, RGB auto-off runs → `zmk_rgb_underglow_off()` → `ext_power_disable()`
+   (`app/src/rgb_underglow.c`), which sets status=0 **and schedules a settings save**.
+2. The board keeps sitting idle, so the 60 s `CONFIG_ZMK_SETTINGS_SAVE_DEBOUNCE` elapses and
+   `ext_power/state=0` is **written to flash**.
+3. At the deep-sleep timeout the SoC powers off; the keypress wake **resets** the board.
+4. On boot, ext-power inits ON, then settings load, `ext_power_settings_set_status()` reads
+   the persisted `0` and **re-disables the rail** → OLED (on that rail) stays dark.
+5. `settings_reset` erases the saved `0`, so ext-power defaults back ON — which is why only
+   that revived it.
+
+(Deep sleep's own suspend also calls `ext_power_disable`, but `sys_poweroff()` fires before
+the 60 s debounce, so that path never persists — confirmed: the wake log always showed
+`status=1`. The idle path is the only one that stays alive long enough to save.)
+
+### Solution
+
+Match zmk-config-rolio (which enables **no** underglow, and never had this) and the actual
+hardware (no underglow/backlight LEDs) — disable both in `config/eyelash_corne.conf`:
+
+```ini
+# RGB underglow OFF: no LEDs here, and its EXT_POWER coupling bricked the OLED (above).
+# CONFIG_WS2812_STRIP=y
+# CONFIG_ZMK_RGB_UNDERGLOW=y
+# CONFIG_ZMK_RGB_UNDERGLOW_AUTO_OFF_IDLE=y  (etc.)
+# CONFIG_ZMK_BACKLIGHT=y                    (no coupling, but LED-less + not in rolio)
+```
+
+With underglow gone nothing disables EXT_POWER while the board is awake, so the OLED rail
+stays powered through idle; deep sleep still powers everything off and the wake-reset brings
+it back with `status=1`. Confirmed on hardware: the OLED returns after every sleep/wake cycle.
+
+> Note the general trap: **any** feature that calls `ext_power_disable()` (RGB underglow's
+> `*_EXT_POWER`/`*_AUTO_OFF_IDLE`) will, on a board where the OLED shares that rail, persist
+> the rail OFF and brick the display until a settings-reset. Only enable EXT_POWER-coupled
+> peripherals that physically exist.
+
 ---
 
 ## The complete fix, file by file
