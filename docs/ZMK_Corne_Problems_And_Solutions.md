@@ -42,6 +42,10 @@ This log has **two phases**:
 - **Part III — The OLED display & the shared I²C transport**
   - [Problem 9 — OLED image pixelized / garbled (wrong `nice_oled` module: an e-paper fork)](#problem-9--oled-image-pixelized--garbled-wrong-nice_oled-module-an-e-paper-fork)
   - [Problem 10 — OLED dark **and** touchpad dead: TWIM (EasyDMA) can't DMA from flash — use TWI](#problem-10--oled-dark-and-touchpad-dead-twim-easydma-cant-dma-from-flash--use-twi)
+- **Part IV — The keyboard is the wrong board: matrix, keymap & polish**
+  - [Problem 11 — No key registers: the board scans the wrong key matrix](#problem-11--no-key-registers-the-board-scans-the-wrong-key-matrix)
+  - [Problem 12 — OLED blanks after ~30 s and doesn't come back](#problem-12--oled-blanks-after-30-s-and-doesnt-come-back)
+  - [Problem 13 — Touchpad works but the right half floods `iqs5xx: Failed to read system info -5`](#problem-13--touchpad-works-but-the-right-half-floods-iqs5xx-failed-to-read-system-info--5)
 - [The complete fix, file by file](#the-complete-fix-file-by-file)
 - [Verification](#verification)
 - [Known-good reference stack](#known-good-reference-stack)
@@ -740,6 +744,125 @@ watched on the USB-CDC console for on-hardware confirmation.
 
 ---
 
+# Part IV — The keyboard is the wrong board: matrix, keymap & polish
+
+With the OLED and touchpad alive (Parts I–III), the halves paired and the touchpad
+moved the cursor — but **no key ever typed**. Root cause: the firmware was built for
+the wrong *board*. `eyelash_corne` (from `a741725193/zmk-new_corne`) is a **5×7** matrix
+with encoder + joystick keys; this hardware is a **plain 42-key Corne wired exactly like
+`zmk-config-rolio`** (`nice_nano_v2` + `sofle`). So the kscan scanned GPIOs the switches
+aren't connected to.
+
+## Problem 11 — No key registers: the board scans the wrong key matrix
+
+### Symptom
+
+Keys, OLED and BLE all "work" (OLED lit, connects to the host), but pressing any key —
+on either half, even over USB — types nothing. A boot log also showed
+`<err> zmk: Too many combos for key position 24`.
+
+### Investigation
+
+- USB-CDC debug logging (`CONFIG_ZMK_LOG_LEVEL_DBG=y` + `-l`) on the central: pressing
+  keys produced **no** `kscan_matrix_read` / position events at all. The matrix isn't
+  detecting presses → it's scanning the wrong pins.
+- The resolved kscan (`kscan_matrix_init_*_inst: Configured pin …`) confirmed the
+  `eyelash_corne` board drives **5 rows × 7 cols** on P0.19/8/12/11,P1.9 × P0.3/28/30/…
+- rolio's `sofle` (which runs on this exact hardware) uses **4 rows × 6 cols** on
+  entirely different pins (`&pro_micro` → P0.02/P1.15/P1.13/P1.11 × P0.29/P1.04/P0.11/
+  P1.00/P0.24/P0.22). The user has **no encoder/joystick** → it's a plain Corne.
+
+### Root cause
+
+The `eyelash_corne` board definition (kscan, transform, physical-layout) does not match
+the hardware. The user's board is a `nice_nano_v2`-wired Corne; only the I²C peripherals
+(OLED/touchpad) happened to share pins, which is why *they* worked while the key matrix
+did not.
+
+### Solution — make the board = rolio's `sofle`, and the keymap 42-key
+
+Board (`boards/arm/eyelash_corne/…`), translating rolio's `&pro_micro` pins to raw nRF
+(this board has no `pro_micro` nexus):
+
+```dts
+/* eyelash_corne.dtsi */
+&kscan0 {                            /* rows only; cols are per-half */
+    row-gpios = <&gpio0 2 …>, <&gpio1 15 …>, <&gpio1 13 …>, <&gpio1 11 …>;  /* 4 rows */
+};
+default_transform: keymap_transform_0 { columns = <12>; rows = <4>;  map = < …42 RC()… >; };
+/* eyelash_corne_left.dts / _right.dts: same 6 col-gpios on both halves */
+&kscan0 { col-gpios = <&gpio0 29 …>,<&gpio1 4 …>,<&gpio0 11 …>,<&gpio1 0 …>,<&gpio0 24 …>,<&gpio0 22 …>; };
+/* RIGHT half only — shift its columns into transform cols 6..11 (like sofle_right.overlay) */
+&default_transform { col-offset = <6>; };
+```
+
+Keymap: the urob keymap is parameterized by `X_*` "extra key" macros (see the
+`eyelash_corne_dongle` config's `extra_keys.h` — the base layout is 34 keys, extras are
+*added*). For a plain 42-key Corne, **empty the joystick middle-column macros**
+(`X_MT/X_MM/X_MB` + `_M`/`_A` variants) so every alpha row is 12 keys, keep the outer
+columns (`X_LT`…) and the middle thumb (`X_MH` = SPACE/RET, the 3rd thumb). Renumber
+`key-labels/eyelash_corne_42.h` to a contiguous **0..41** (drop `JT0/JM/EB0/JB0`) so
+combos track it, and delete the encoder `&inc_dec_kp` sensor line. Result: exactly 42
+bindings/layer, matching the 42-position transform (the "Too many combos" error also
+disappears because positions renumber correctly). Verified on hardware: both halves type.
+
+## Problem 12 — OLED blanks after ~30 s and doesn't come back
+
+### Symptom
+
+The OLED lights at boot but goes dark after a short idle and only returns on reset.
+
+### Root cause
+
+The shared conf inherited `CONFIG_ZMK_DISPLAY_BLANK_ON_IDLE=y` with a 30 s
+`CONFIG_ZMK_IDLE_TIMEOUT`, so the panel blanks on idle. rolio keeps its display on.
+
+### Solution
+
+Match rolio in `config/eyelash_corne.conf`:
+
+```ini
+CONFIG_ZMK_DISPLAY_BLANK_ON_IDLE=n
+CONFIG_ZMK_IDLE_TIMEOUT=600000     # 10 min, as rolio's sofle_left.conf
+```
+
+## Problem 13 — Touchpad works but the right half floods `iqs5xx: Failed to read system info -5`
+
+### Symptom
+
+The touchpad functions (move, scroll, two-finger right-click, drag) but the right-half
+USB-CDC log is flooded, hundreds/sec, with:
+
+```text
+<err> i2c_nrfx_twi: Error 0x0BAE0001 occurred for message 0
+<err> iqs5xx: Failed to read system info 0: -5      (-EIO / I²C NACK)
+```
+
+### Investigation / root cause
+
+The IQS5xx initialises (`IQS5xx trackpad initialized`) and enough reads succeed to drive
+the cursor, but many reads NACK. The flood is **massively amplified by the debug setup**:
+the peripheral was on **USB streaming DBG logs**, and *every* I²C failure emits a log line
+over USB-CDC, which saturates the CPU — and the legacy **`nordic,nrf-twi`** driver is
+**blocking and timing-sensitive**, so the logging starves its transactions and they NACK,
+producing more error logs. rolio (no logging) shows no such flood. (The concurrent
+`<wrn> bt_gatt: Link is not encrypted` / `send_position_state_callback: Error notifying
+-128` lines are transient split-pairing warnings before encryption completes — harmless.)
+
+### Solution
+
+Remove the debug logging for the production firmware: delete `CONFIG_ZMK_LOG_LEVEL_DBG=y`
+and build **without** `-l` (no `zmk-usb-logging` snippet). With no USB-CDC log flood the
+CPU no longer starves the TWI driver, and in normal (battery, no-USB) use the touchpad
+runs cleanly — confirmed on hardware.
+
+> **If the NACKs ever persist in production** (e.g. battery drains fast / the pad lags),
+> the real fix is driver-side: gate the IQS5xx reads on the **RDY** pin so the host only
+> reads inside the chip's data-ready window (the Azoteq part NACKs reads issued outside
+> it), or add I²C bus-recovery. That is a change to the `zmk-driver-azoteq-iqs5xx` fork.
+
+---
+
 ## The complete fix, file by file
 
 ### `prepare_zmk_build_environment.sh`
@@ -887,3 +1010,14 @@ zephyr_version: 350
    while the same hardware worked under rolio. Static config/DT-node diffing missed
    it because only the bus *binding* differed; the resolved `i2c@40003000` node
    showed it at once (Problem 10).
+13. **Peripherals working ≠ right board.** The OLED and touchpad came up because
+   they sit on standard I²C pins, which masked that the whole *board* was wrong for
+   this hardware — the **key matrix** scanned pins the switches aren't wired to. When
+   keys are totally dead, log the kscan (`kscan_matrix_read` / `Configured pin …`)
+   and compare the *resolved* rows/cols to a known-good config (rolio's `sofle`);
+   match the hardware, don't assume the board name (Problem 11).
+14. **Debug logging can *manufacture* errors.** Heavy `CONFIG_ZMK_LOG_LEVEL_DBG`
+   over USB-CDC floods the CPU; a *blocking* driver (legacy `nordic,nrf-twi`) then
+   starves and its transactions NACK — so the logs report I²C errors the production
+   firmware doesn't have. Confirm a suspicious flood is real by testing without
+   logging before "fixing" it (Problem 13).
