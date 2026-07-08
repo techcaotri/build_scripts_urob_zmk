@@ -39,6 +39,9 @@ This log has **two phases**:
   - [Problem 6 — Driver as an out-of-tree symlink breaks `zephyr_library_amend`](#problem-6--driver-as-an-out-of-tree-symlink-breaks-zephyr_library_amend)
   - [Problem 7 — Hand-editing `west.yml` dropped the `projects:` key](#problem-7--hand-editing-westyml-dropped-the-projects-key)
   - [Problem 8 — A display-less right half: removing the peripheral-OLED module](#problem-8--a-display-less-right-half-removing-the-peripheral-oled-module)
+- **Part III — The OLED display & the shared I²C transport**
+  - [Problem 9 — OLED image pixelized / garbled (wrong `nice_oled` module: an e-paper fork)](#problem-9--oled-image-pixelized--garbled-wrong-nice_oled-module-an-e-paper-fork)
+  - [Problem 10 — OLED dark **and** touchpad dead: TWIM (EasyDMA) can't DMA from flash — use TWI](#problem-10--oled-dark-and-touchpad-dead-twim-easydma-cant-dma-from-flash--use-twi)
 - [The complete fix, file by file](#the-complete-fix-file-by-file)
 - [Verification](#verification)
 - [Known-good reference stack](#known-good-reference-stack)
@@ -614,6 +617,129 @@ a separate branch). A shield-less board's firmware is suffixed `nodisplay`, e.g.
 
 ---
 
+# Part III — The OLED display & the shared I²C transport
+
+Parts I–II got the firmware building and the touchpad driver compiled. The next two
+problems only surfaced when the firmware was **flashed on real hardware** and
+compared, symptom-by-symptom, against the working `zmk-config-rolio` reference —
+which is the *same keyboard* (42-key Corne + TPS65 touchpad + 128×32 SSD1306 OLED).
+The hardware later turned out to carry a **128×32 SSD1306 OLED on the left** (not the
+e-paper the config was first written against), so the display path was reworked to
+match rolio: OLED on I²C0 `@0x3c`, driven by the upstream `nice_oled` widgets.
+
+## Problem 9 — OLED image pixelized / garbled (wrong `nice_oled` module: an e-paper fork)
+
+### Symptom
+
+The left 128×32 SSD1306 OLED lit up but rendered a **pixelized / garbled / doubled**
+image instead of the clean status screen.
+
+### Investigation
+
+- The resolved panel node (`ssd1306@3c`: `width 128`, `height 32`,
+  `multiplex-ratio 0x1f`, `com-sequential`, `segment-remap`, `com-invdir`,
+  `inversion-on`, `prechargep 0x22`) was **byte-identical** to rolio's.
+- The LVGL config was already 1-bit (`LV_COLOR_DEPTH_1`, `LV_Z_BITS_PER_PIXEL=1`,
+  `LV_Z_VDB_SIZE=64`) — identical to rolio. So colour depth was not it.
+- The one divergence was the **`zmk-nice-oled` module revision**. The eyelash pinned
+  `techcaotri/zmk-nice-oled@ff9969d`; its commit history (*"…for 'nice_epaper'
+  config"*, *"add 'nice_epaper_new'"*) shows it was tuned for an **e-paper** panel —
+  different fonts, assets and layout than the OLED. rolio pins upstream
+  `mctechnology17/zmk-nice-oled@main`.
+
+### Root cause
+
+The e-paper-tuned rendering module drew for a different panel geometry/asset set →
+garbage on the SSD1306.
+
+### Solution
+
+Follow rolio: repoint `config/west.yml` to `mctechnology17/zmk-nice-oled@main` (add
+the `mctechnology17` remote) and `west update zmk-nice-oled`. The module tree is then
+**byte-identical** to rolio's (`46f824a`). Also drop the conf's `*_LUNA` widget
+overrides and use the module's **default** widgets like rolio (WPM + bongo-cat,
+status, layer, fixed modifier indicators, HID indicators):
+
+```ini
+# config/eyelash_corne.conf — was: CONFIG_NICE_OLED_WIDGET_WPM_LUNA=y (+ *_LUNA)
+CONFIG_ZMK_DISPLAY_STATUS_SCREEN_CUSTOM=y
+CONFIG_ZMK_DISPLAY_WORK_QUEUE_DEDICATED=y
+# (no *_WIDGET_* overrides → module defaults, exactly as rolio)
+```
+
+The `*_LUNA` overrides had a second cost: on the upstream module they force-compile
+`luna.c` alongside the default `bongo_cat.c`, which define the same globals
+(`current_anim_state`, `idle/slow/mid/fast_imgs`) with no `extern` → a **`multiple
+definition`** link error. Using rolio's defaults resolves both.
+
+## Problem 10 — OLED dark **and** touchpad dead: TWIM (EasyDMA) can't DMA from flash — use TWI
+
+### Symptom
+
+After Problem 9's module fix the OLED went **fully dark** (no pixels), and the
+**touchpad did not work at all** — yet the *same hardware* runs rolio's firmware
+(both `master` and `tps65-oled`) with a working OLED **and** touchpad.
+
+### Investigation
+
+- Both devices sit on `i2c0` — OLED `@0x3c` (left), touchpad `@0x74` (right). "Both
+  broken on the eyelash firmware, both fine on rolio, same physical keyboard" points
+  at the **shared I²C bus**, not at either device's node or driver.
+- Diffing the *resolved* devicetree `i2c@40003000` node between the eyelash and rolio
+  builds surfaced the only hardware difference left:
+
+  | | eyelash (broken) | rolio (works) |
+  | --- | --- | --- |
+  | `compatible` | `nordic,nrf-twim` | `nordic,nrf-twi` |
+  | `clock-frequency` | `400000` (right half) | `100000` |
+
+  The eyelash's `eyelash_corne_{left,right}.dts` explicitly set
+  `compatible = "nordic,nrf-twim"`; rolio's `&pro_micro_i2c` keeps the board default
+  `nordic,nrf-twi`.
+
+### Root cause
+
+On the nRF52840, **TWIM** is the EasyDMA I²C master. EasyDMA transfers must source
+their bytes from **RAM** — it **cannot read from flash / RODATA**. Both the Zephyr
+`ssd1306` panel driver and the Azoteq `iqs5xx` driver issue their init/command
+sequences from **`const` (flash-resident)** byte arrays. On TWIM those writes fail
+(EasyDMA can't fetch the source bytes), so the OLED never initialises and the touchpad
+never comes up — **silently**, with no build error. The legacy **TWI** driver clocks
+bytes out one at a time from *any* memory, so it works. rolio uses TWI — which is
+exactly why the two peripherals only worked under rolio's firmware.
+
+### Solution
+
+Match rolio exactly: force the legacy TWI on **both** halves (`i2c0` is the same
+peripheral instance on each), and drop the right half's 400 kHz override back to
+rolio's 100 kHz:
+
+```dts
+&i2c0 {
+    compatible = "nordic,nrf-twi";     /* NOT nordic,nrf-twim (EasyDMA) */
+    status = "okay";
+    pinctrl-0 = <&i2c0_default>;       /* NRF_PSEL(TWIM_SDA/SCL, 0, 17/20) — */
+    pinctrl-1 = <&i2c0_sleep>;         /* the TWIM_* PSEL macros are correct for TWI too */
+    clock-frequency = <100000>;        /* right half only; was 400000 */
+    /* … ssd1306@3c (left) / iqs5xx@74 (right) … */
+};
+```
+
+Verified: both halves' **resolved** devicetree now shows `compatible = "nordic,nrf-twi"`
+@ `0x186a0` (100 kHz), identical to rolio's known-good build. The fix firmware was
+rebuilt with the `zmk-usb-logging` snippet (`-l`) so the SSD1306 / IQS5xx init can be
+watched on the USB-CDC console for on-hardware confirmation.
+
+> **Why static config-diffing missed it.** The `nice_oled` module, the display
+> Kconfig, the LVGL settings and the panel node were *all* byte-identical to rolio.
+> The only divergence was the I²C **binding** — a board-transport detail that does not
+> change the framebuffer *contents*, only whether the bytes ever reach the panel. The
+> tell for a transport (bus-driver) bug rather than a device/config one: **two
+> independent peripherals both dead on one firmware and both alive on another, on the
+> same hardware.** When that happens, diff the *resolved* devicetree of the shared bus.
+
+---
+
 ## The complete fix, file by file
 
 ### `prepare_zmk_build_environment.sh`
@@ -748,3 +874,16 @@ zephyr_version: 350
    board-specific `eyelash_corne_right.conf` in *addition* to the shared
    `eyelash_corne.conf` (later wins), which is how the right half can drop the
    display while the left keeps it.
+11. **Mirror the reference's module pins; don't fork blindly.** When a repo is
+   "the same keyboard" (here `zmk-config-rolio`), pin shared display/widget modules
+   to the *same* source it uses. A `zmk-nice-oled` fork tuned for an e-paper panel
+   rendered garbage on the SSD1306 OLED; switching to rolio's
+   `mctechnology17/zmk-nice-oled@main` (and its default widgets) fixed it (Problem 9).
+12. **Two peripherals dead on one firmware, alive on another → suspect the shared
+   bus, and diff the *resolved* devicetree.** The eyelash forced
+   `nordic,nrf-twim` (EasyDMA, RAM-only source) on `i2c0`; rolio used
+   `nordic,nrf-twi`. TWIM cannot transmit the SSD1306 / IQS5xx drivers' `const`
+   (flash) command buffers, so the OLED **and** the touchpad silently failed —
+   while the same hardware worked under rolio. Static config/DT-node diffing missed
+   it because only the bus *binding* differed; the resolved `i2c@40003000` node
+   showed it at once (Problem 10).
