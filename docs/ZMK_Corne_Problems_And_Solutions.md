@@ -1212,6 +1212,77 @@ zephyr_version: 350
 
 ---
 
+## Problem 18 — A pointing/input-processor module won't build: `drivers/input_processor.h: No such file or directory`
+
+**Symptom.** Adding `oleksandrmaslov/zmk-pointing-acceleration` (cursor acceleration)
+to `west.yml` and its `&pointer_accel` node to the keymap made **every** target fail
+to compile:
+
+```
+zmk-pointing-acceleration/src/input_processor_accel.c:3:10:
+    fatal error: drivers/input_processor.h: No such file or directory
+```
+
+**Root cause.** The header exists at `zmk/app/include/drivers/input_processor.h`, and
+ZMK's *own* input-processor sources include it the same way — but our pinned **ZMK
+v0.2** exposes that directory only to the app target:
+
+```cmake
+# zmk/app/CMakeLists.txt
+target_include_directories(app PRIVATE include)     # PRIVATE, not exported to modules
+```
+
+A module is a *separate* `zephyr_library`, so it never inherits the app's private
+include path. (Newer ZMK exposes the header to modules; ours predates that.) The
+failure is easy to misread: `west build` returned 0 even though individual targets
+failed (the build script builds each `build.yaml` entry in a loop and doesn't
+propagate a single target's failure), and a fresh `.config` exists *after configure*
+— so "the module is enabled" looked true while nothing linked.
+
+**Fix.** One line in the module's `CMakeLists.txt`, on a **techcaotri fork**
+(`zmk-pointing-acceleration@corne-touchpad`), pointing the library at the built
+application's include dir:
+
+```cmake
+zephyr_library_include_directories(${APPLICATION_SOURCE_DIR}/include)
+```
+
+`APPLICATION_SOURCE_DIR` is the app being built (`zmk/app`), so this resolves
+`<drivers/input_processor.h>` regardless of workspace layout. `west.yml` pins the fork
+(`b440ad6`). **Diagnosis tip:** when a `-b <board>` build "passes" but the firmware
+is stale, check for a `zmk.uf2` in each `build/<target>/zephyr/` dir — a missing one
+is a silently-failed target; re-run `ninja -C <that build dir>` to see the real error.
+
+---
+
+## Problem 19 — A `.dts`/overlay can't read a `CONFIG_*` option (`#if` is silently always-false)
+
+**Symptom.** Guarding devicetree properties on a Kconfig symbol did nothing — the
+props were **absent** from the generated devicetree even though `autoconf.h` defined
+the symbol as `1`:
+
+```dts
+#if defined(CONFIG_EYELASH_TOUCHPAD_NATURAL_SCROLL)   // symbol IS =y in .config…
+        natural-scroll-y;                              // …yet these never appear
+        natural-scroll-x;
+#endif
+```
+
+**Root cause.** **Zephyr processes the devicetree *before* Kconfig** — the devicetree
+is an *input* to Kconfig (Kconfig defaults can depend on DT via `dt_compat_enabled`),
+not the other way round. So when the `.dts` is preprocessed, `autoconf.h` doesn't
+exist yet and every `CONFIG_*` macro is undefined → `#if defined(CONFIG_…)` is always
+false. This is by design; you **cannot** conditionalize devicetree on Kconfig.
+
+**Fix.** Put the toggle where `CONFIG_*` *is* available — the driver **C code**,
+compiled after Kconfig, where `IS_ENABLED(CONFIG_…)` resolves (to a compile-time
+constant, so the dead branch is eliminated — no runtime cost). Here the
+natural/classic scroll toggle became `CONFIG_INPUT_AZOTEQ_IQS5XX_NATURAL_SCROLL`
+(driver Kconfig, default `y`), applied as a scroll-axis inversion in `iqs5xx.c`. The
+reverse direction *does* work — Kconfig **can** read DT — just not this way.
+
+---
+
 ## Lessons & prevention
 
 1. **Pin, don't float.** A keyboard config that imports ZMK at `revision: main`
@@ -1296,3 +1367,18 @@ zephyr_version: 350
    capture (`Failed to start advertising (-22)`, 4× i2c-error density on the failure).
    Several plausible-sounding fixes applied before the capture were wrong or made it
    worse; the log named the exact cause (Problem 16).
+19. **A third-party module may need a one-line fork to build on the pinned ZMK.**
+   Modules written against ZMK `main` can assume includes/APIs our v0.2 pin doesn't
+   export (`app/include` is *private* there). Expect to fork-and-patch, and verify
+   *every* `build.yaml` target actually produced a `zmk.uf2` — the wrapper's exit
+   code hides a single failed target (Problem 18).
+20. **Devicetree is an input to Kconfig, not the reverse.** A `.dts`/overlay cannot
+   read `CONFIG_*` (it's preprocessed before `autoconf.h` exists), so build-time
+   feature toggles that must change the devicetree belong in **C code**
+   (`IS_ENABLED`) or in a separate overlay/snippet — never an `#if` in the `.dts`
+   (Problem 19).
+21. **Verify a toggle actually flips, and confirm the *default* on hardware.** The
+   natural/classic scroll option was proven non-trivial by building both values and
+   diffing the `.uf2` (identical ⇒ no-op bug); the correct default polarity was then
+   fixed against a hardware-confirmed reference (the `=y` build made byte-identical to
+   the direction the user verified as natural).
