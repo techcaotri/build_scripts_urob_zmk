@@ -923,6 +923,130 @@ it back with `status=1`. Confirmed on hardware: the OLED returns after every sle
 > the rail OFF and brick the display until a settings-reset. Only enable EXT_POWER-coupled
 > peripherals that physically exist.
 
+# Part V — The BLE split: touchpad relay & reconnection
+
+## Problem 15 — Split BLE tuning: the touchpad doesn't relay, and the left↔right link is flaky
+
+### Symptom
+
+After the split re-paired, **keys typed from both halves but the touchpad did nothing**, and
+the left↔right link was intermittent, while the left↔host (PC) link was fine.
+
+### Investigation
+
+Paired USB-CDC logging on both halves. The central discovered the peripheral's split service
+and `[SUBSCRIBED]` to the **position-state** characteristic (keys), but on the **input**
+(pointer) characteristic the log showed `bt_smp: pairing failed (peer reason 0x3)` /
+`Security failed … err 4` — the input slot was reserved but never completed. So keys relayed
+over a tolerant path; the pointer subscription needed a security level the link never reached.
+
+Comparing to **zmk-config-rolio** (the golden reference, which never had this): rolio sets
+exactly two BLE configs, and we were matching **neither**.
+
+### Root cause
+
+1. `CONFIG_BT_GATT_ENFORCE_SUBSCRIPTION` (Zephyr default **y**). The peripheral (right) is the
+   GATT **server** for the split; with enforcement on it blocks the central's input-characteristic
+   subscription/notifications until the link is fully secured. Keys tolerate this; the pointer
+   relay does not.
+2. `CONFIG_BT_CTLR_TX_PWR_PLUS_8` unset → 0 dBm. rolio enables +8 dBm; its comment is literally
+   *"solve latency and poor left-right communication."* Less margin → more supervision-timeout drops.
+
+### Solution
+
+Match rolio in `config/eyelash_corne.conf` (shared conf → applies to both halves):
+
+```ini
+CONFIG_BT_CTLR_TX_PWR_PLUS_8=y          # +8 dBm; rolio: "poor left-right communication"
+CONFIG_BT_GATT_ENFORCE_SUBSCRIPTION=n   # let the split INPUT (pointer) subscription complete
+```
+
+After this the touchpad relayed and the link encrypted (`security_changed … level 2`) on connect.
+
+> Also mandatory for a clean split bond: after a `settings_reset`, reset **both** halves and
+> re-pair. Resetting only one leaves the other with a stale bond → `err 4` churn (pressing the
+> physical reset button does **not** clear the bond — only flashing the `settings_reset` firmware
+> does). A `eyelash_corne_right_settings_reset` build target was added for this.
+
+## Problem 16 — Split won't reconnect after a central reset — intermittently, and always under touchpad load
+
+The hardest problem in this project; it took paired-half logging and two wrong turns.
+
+### Symptom
+
+After resetting the **left (central)**, the right half would sometimes fail to reconnect. The
+tell that cracked it: **if a finger was moving on the touchpad during the reset, reconnect
+failed; pressing keys instead, it reconnected.** The host link was unaffected throughout.
+
+### Investigation
+
+- Two-half capture, success (no touch) vs. fail (constant touch). Success: `disconnected
+  (reason 0x08)` → `security_changed level 2` ~0.5 s later. Fail: after the disconnect, **only**
+  a flood of `iqs5xx: Failed to read system info -5` / `i2c_nrfx_twi: Error 0x0BAE0001`, and **no
+  reconnect** for 20+ s.
+- A 13-reset run reconnected 12×; the single failure had **4× the i2c-error density** (548 vs
+  134) — i.e. much heavier touchpad movement during that reset.
+- On the failed cycle the peripheral logged `Failed to start advertising (-22)` (`-EINVAL`) +
+  `bt_conn: Found valid connection … in disconnected state`, then gave up.
+
+### Root cause (two coupled problems)
+
+1. **Advertising `-EINVAL` race.** The peripheral re-advertises with **directed** advertising to
+   the just-dropped central (`peripheral.c` `start_advertising` → `BT_LE_ADV_CONN_DIR`). Right
+   after a disconnect the old connection object isn't freed yet, so `bt_le_adv_start` returns
+   `-EINVAL`. Upstream `advertising_cb` **logged the error and never retried** → no advertise →
+   no reconnect. Without load the timing usually wins; under load it loses.
+2. **Touchpad starves the system work queue.** The IQS5xx RDY interrupt does its **blocking** I²C
+   reads via `k_work_submit(&data->work)` on the **system** work queue. Under hard movement RDY
+   fires during every read, so the read work **re-queues itself back-to-back**, monopolizing the
+   system queue. The peripheral's connection-cleanup **and** advertising work live on that same
+   queue → they never run → the connection object never frees → advertising can't start. Light
+   touch/keys don't saturate it — hence intermittent and load-dependent.
+
+### Solution (both are required)
+
+1. **`zmk` — `app/src/split/bluetooth/peripheral.c`**: make `advertising_work` a
+   `k_work_delayable` and **retry on `-EINVAL`**:
+   ```c
+   if (err == -EINVAL) { k_work_reschedule(&advertising_work, K_MSEC(50)); return; }
+   ```
+   so the peripheral keeps trying until cleanup finishes and advertising succeeds.
+2. **`zmk-driver-azoteq-iqs5xx` — `drivers/input/iqs5xx.c`**: run the touchpad reads on a
+   **dedicated, preemptible-priority work queue** (`k_work_queue_start`, prio 10) instead of the
+   system queue, so the system queue stays free for BLE cleanup + advertising during a touchpad
+   flood.
+
+Fixing only #1 left it failing under *heavy* load (starvation); fixing only #2 without #1 made
+it **worse** (advertising ran promptly, hit `-EINVAL`, gave up). Together: **15/15 resets
+reconnected with hard continuous touchpad movement**, confirmed on hardware — including on the
+logging build, a harder case since USB logging amplifies the i2c flood.
+
+Both changes live in **`techcaotri` forks on branch `corne-touchpad`**, wired via
+`config/west.yml` (`zmk` → `remote: techcaotri`, `zmk-driver-azoteq-iqs5xx` →
+`revision: corne-touchpad`) so `west update` keeps them.
+
+> This is the *real*, driver-side resolution of the `iqs5xx -5` flood from Problem 13: the flood
+> is benign to the touchpad itself, but on the shared system work queue it was starving BLE.
+
+## Problem 17 — Right-half "connected" indicator on the OLED: dropped
+
+### Symptom / investigation
+
+Goal: a "right half connected" indicator on the left OLED. Enabled
+`CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING` + the nice_oled peripheral-battery widget
+(`CENTRAL_SHOW_BATTERY_PERIPHERAL_AND_CENTRAL`), but no number appeared. Logs proved the data
+arrived (central read the peripheral's battery, 71–72%). Calibrating widget Y-positions against
+a screenshot showed the module draws all widgets into a **68×160 portrait canvas then rotates it
+90°**; the peripheral-battery text is **hard-coded** to canvas `(0,19)`, which lands **above the
+visible area** on this panel (visible content starts at the BT/profile row, canvas Y≈32). The
+position is not a config option.
+
+### Decision
+
+**Dropped.** Repositioning requires editing the pulled `nice_oled` module (not durable), and it
+added an encrypted peripheral-battery GATT read over the split for no visible benefit. Left
+disabled in `config/eyelash_corne.conf`; revisit only via a proper module fork if wanted.
+
 ---
 
 ## The complete fix, file by file
@@ -970,6 +1094,72 @@ it back with `status=1`. Confirmed on hardware: the OLED returns after every sle
 
 - Removed the interim `link_local_iqs5xx_driver` symlink helper; the driver is now
   pulled as a normal `west` module from the fork (Problem 6).
+
+### BLE split: touchpad relay & reconnection (Part V)
+
+**`config/eyelash_corne.conf`** — match rolio's BLE tuning (Problem 15):
+
+```ini
+CONFIG_BT_CTLR_TX_PWR_PLUS_8=y          # +8 dBm; rolio: "poor left-right communication"
+CONFIG_BT_GATT_ENFORCE_SUBSCRIPTION=n   # let the split INPUT (pointer) subscription complete
+```
+
+(plus RGB underglow + backlight disabled, Problem 14; the peripheral-battery indicator left
+commented out, Problem 17.)
+
+**`zmk` fork — `app/src/split/bluetooth/peripheral.c`** (Problem 16 — advertising `-EINVAL`
+retry). `advertising_work` becomes a `k_work_delayable`; the callback retries on `-EINVAL`:
+
+```c
+static struct k_work_delayable advertising_work;
+
+static void advertising_cb(struct k_work *work) {
+    const int err = start_advertising(low_duty_advertising);
+    if (err == -EINVAL) {                 // conn object not freed yet -> retry until it is
+        k_work_reschedule(&advertising_work, K_MSEC(50));
+        return;
+    }
+    if (err < 0) { LOG_ERR("Failed to start advertising (%d)", err); }
+}
+```
+
+The three `k_work_submit(&advertising_work)` sites become `k_work_reschedule(&advertising_work,
+K_NO_WAIT)`, and `k_work_init_delayable(&advertising_work, advertising_cb)` is added in
+`zmk_peripheral_ble_complete_startup()` (before `bt_conn_cb_register`).
+
+**`zmk-driver-azoteq-iqs5xx` fork — `drivers/input/iqs5xx.c`** (Problem 16 — dedicated queue):
+
+```c
+#define IQS5XX_WORKQ_STACK_SIZE 2048
+#define IQS5XX_WORKQ_PRIORITY   10        // preemptible, below BLE
+K_THREAD_STACK_DEFINE(iqs5xx_workq_stack, IQS5XX_WORKQ_STACK_SIZE);
+static struct k_work_q iqs5xx_workq;
+static bool iqs5xx_workq_started;
+
+// RDY handler:  k_work_submit_to_queue(&iqs5xx_workq, &data->work);   // was k_work_submit(&data->work)
+// iqs5xx_init(): start the queue once —
+//   k_work_queue_start(&iqs5xx_workq, iqs5xx_workq_stack,
+//                      K_THREAD_STACK_SIZEOF(iqs5xx_workq_stack), IQS5XX_WORKQ_PRIORITY, NULL);
+```
+
+**`config/west.yml`** — both fixes wired to `techcaotri` forks, branch `corne-touchpad`:
+
+```yaml
+- name: zmk
+  remote: techcaotri            # was zmkfirmware
+  revision: corne-touchpad      # = pinned base 6f85f48b + advertising-retry
+  import: app/west.yml
+- name: zmk-driver-azoteq-iqs5xx
+  remote: techcaotri
+  revision: corne-touchpad      # = feature/zoom-and-swipe + dedicated work queue
+```
+
+**`prepare_zmk_build_environment.sh`** — `prepare_eyelash_corne_touchpad()` now clones
+`from-urob-zmk-config` on branch `corne-touchpad` (was `eyelash_corne_touchpad`).
+
+**`build.yaml`** — added an `eyelash_corne_right` + `settings_reset` entry
+(`eyelash_corne_right_settings_reset`) so **both** halves' bonds can be cleared for a clean
+re-pair (Problem 15).
 
 ---
 
@@ -1083,3 +1273,26 @@ zephyr_version: 350
    starves and its transactions NACK — so the logs report I²C errors the production
    firmware doesn't have. Confirm a suspicious flood is real by testing without
    logging before "fixing" it (Problem 13).
+15. **A blocking peripheral driver on the *system* work queue can starve BLE.** The
+   IQS5xx read work re-queued itself back-to-back under hard touchpad use and
+   monopolized the shared system queue, starving the split peripheral's connection
+   cleanup + re-advertise so it couldn't reconnect. Give a high-rate blocking driver
+   its **own** low-priority work queue; keep the system queue free for the stack
+   (Problem 16).
+16. **Directed advertising must be retried, not logged-and-dropped.** A split
+   peripheral re-advertising to the just-dropped central hits `-EINVAL` while that
+   connection object is still freeing; upstream logged it and gave up. Retrying on
+   `-EINVAL` (delayable work, 50 ms) is what makes reconnection reliable under load
+   (Problem 16).
+17. **Match the reference's BLE tuning, not just its pins.** rolio's two BLE knobs —
+   `CONFIG_BT_CTLR_TX_PWR_PLUS_8=y` and `CONFIG_BT_GATT_ENFORCE_SUBSCRIPTION=n` — were
+   the difference between "keys relay but the touchpad doesn't / the link is flaky"
+   and a working split. The GATT-subscription-enforcement default silently blocks the
+   pointer relay on the peripheral (the GATT server) until the link is fully secured
+   (Problem 15).
+18. **Read the logs; don't guess — and let the symptom localize the fix.** The
+   intermittent reconnect was only cracked by a *user-supplied discriminator*
+   ("moving the touchpad breaks it, keys don't") plus a success-vs-fail two-half
+   capture (`Failed to start advertising (-22)`, 4× i2c-error density on the failure).
+   Several plausible-sounding fixes applied before the capture were wrong or made it
+   worse; the log named the exact cause (Problem 16).

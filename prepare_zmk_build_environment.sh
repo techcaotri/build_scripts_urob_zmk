@@ -352,7 +352,7 @@ prepare_eyelash_corne_touchpad() {
 	info "Checking source from-urob-zmk-config file exist..."
 	if [ ! -d from-urob-zmk-config ]; then
     info "Cloning source from-urob-zmk-config directory for Eyelash Corne nicenano With Touchpad"
-		git clone --recurse-submodules -j8 -b eyelash_corne_touchpad git@github.com:techcaotri/from-urob-zmk-config.git
+		git clone --recurse-submodules -j8 -b corne-touchpad git@github.com:techcaotri/from-urob-zmk-config.git
 	fi
 
 	info "Checking config file exist..."
