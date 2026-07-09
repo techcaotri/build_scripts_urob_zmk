@@ -1283,6 +1283,70 @@ reverse direction *does* work — Kconfig **can** read DT — just not this way.
 
 ---
 
+## Problem 20 — Touchpad dead after deep sleep (EXT_POWER rail cut + cold re-init race); keys still work
+
+**Symptom.** After the keyboard deep-sleeps and wakes, the RIGHT-half **touchpad is
+dead** (no cursor) — but you can **type normally on both halves**. Intermittent (many
+wakes are fine). Only re-flashing / power-cycling the right half brought it back.
+
+**Why keys work but the touchpad doesn't (the discriminator that localizes the bug).**
+They ride different paths: keys go over the matrix GPIOs + the keyboard HID relay; the
+touchpad rides the **switched-VCC rail** + the separate `zmk,input-split` *pointer* relay.
+So the peripheral can reconnect and relay keys while the touchpad chip is dead — the bug is
+in the touchpad chip's re-init, **not** the split.
+
+**Root cause (confirmed from a right-half USB-CDC wake log).**
+1. On idle, `activity.c` → `zmk_pm_suspend_devices()` runs `PM_DEVICE_ACTION_SUSPEND` on the
+   `zmk,ext-power-generic` node → drives its control-gpio (**P0.13**) low → **cuts the
+   touchpad's switched-VCC rail** → then `sys_poweroff()` = nRF52840 **System OFF**.
+2. Wake (a right-half keypress is the only wake source) = **full chip reset** → `iqs5xx_init`
+   runs while the chip is still doing its power-on **ATI settle** and NACKs I²C.
+3. The driver waited a **fixed 100 ms** — marginally too short; the chip can take hundreds of
+   ms, sometimes **seconds**, to answer — and its config writes had **no retry**, so the first
+   write NACKed (`-EIO`), init aborted, `initialized` was never set.
+4. There was **no runtime recovery**, so the work handler (RDY still fires) just spammed
+   `Failed to read system info 0: -5` forever until a manual reset. Intermittent because the
+   settle time is marginal against the fixed delay.
+
+**Log signature:** *no* `IQS5xx trackpad initialized` after the wake boot, then endless
+`i2c_nrfx_twi: Error 0x0BAE0001` / `iqs5xx: Failed to read system info 0: -5`.
+
+**Reproducing it — two gotchas.**
+- **ZMK never deep-sleeps while USB is plugged in.** `activity.c` guards the sleep with
+  `if (inactive_time > MAX_SLEEP_MS && !is_usb_power_present())`, so cabling a half for logs
+  *blocks* the very state you need. For a throwaway debug build, drop that guard
+  (`sed -i 's/ && !is_usb_power_present()//' zmk/app/src/activity.c`) so it sleeps on USB.
+- **Both halves must sleep together.** The central (left) also deep-sleeps; if it stays awake
+  the system state differs and the bug hides. Build **both** halves with a short
+  `CONFIG_ZMK_IDLE_SLEEP_TIMEOUT` (e.g. `15000`) + the USB-sleep patch so the whole keyboard
+  sleeps and wakes as one. (Add `CONFIG_INPUT_LOG_LEVEL_DBG=y` + build with `-l` for the log.)
+
+**The fix (self-healing, driver-only — `zmk-driver-azoteq-iqs5xx/drivers/input/iqs5xx.c`).**
+1. **Poll-until-ready:** `iqs5xx_setup_device` now reads `SYSTEM_INFO_0` in a loop until the
+   chip ACKs (`iqs5xx_wait_for_ready`, up to ~600 ms) before configuring, replacing the single
+   fixed delay.
+2. **Runtime auto-recovery:** the work handler counts consecutive I²C read failures and, after
+   `IQS5XX_IO_FAIL_RECOVER` (5), re-initializes the chip (`iqs5xx_recover`: pulse RESET + re-run
+   setup). RDY keeps firing after a failed cold-wake init (the chip asserts it once it finally
+   powers up), which is what triggers the recovery — so it heals even when the chip answers
+   **seconds** after wake, well past the init poll window.
+
+No behaviour change when healthy (`wait_for_ready` returns on the first read; the counter stays
+0). **Deep sleep stays enabled**, so the peripheral's battery savings are preserved.
+
+**Confirmation.** A wake-cycle log showed the recovery firing and succeeding **15/15**: each
+dead wake produced `Touchpad unreachable; re-initializing` → `Touchpad recovered` within ~20 ms,
+then the pad worked. 10+ manual sleep/wake cycles with both halves sleeping: no dead touchpad.
+(In production, with no logging, the `-5` errors are silent and the pad is live within a
+fraction of a second of waking.)
+
+**Alternatives considered (not needed).** Disabling deep sleep on the peripheral
+(`CONFIG_ZMK_SLEEP=n` on the right — guaranteed but costs right-half battery); or power-cycling
+EXT_POWER inside the recovery (kept in reserve had a RESET pulse been insufficient — it wasn't,
+because the chip *is* powered again a few seconds after wake; it just needed re-configuring).
+
+---
+
 ## Lessons & prevention
 
 1. **Pin, don't float.** A keyboard config that imports ZMK at `revision: main`
@@ -1382,3 +1446,16 @@ reverse direction *does* work — Kconfig **can** read DT — just not this way.
    diffing the `.uf2` (identical ⇒ no-op bug); the correct default polarity was then
    fixed against a hardware-confirmed reference (the `=y` build made byte-identical to
    the direction the user verified as natural).
+22. **A peripheral pointing device on the switched-VCC rail must survive a deep-sleep
+   power-cycle.** Deep sleep = System OFF cuts EXT_POWER; wake = a cold chip reset. Init
+   that assumes a warm chip (a fixed post-reset delay, no NACK retry) leaves the device
+   dead. Make init **poll until the chip ACKs**, and add a **runtime re-init on repeated
+   I²C failure** so it self-heals when the chip answers seconds later — never trust a fixed
+   delay across a power-cycle (Problem 20).
+23. **To reproduce a deep-sleep bug over USB, drop the USB-power sleep guard, shorten the
+   timeout, and sleep BOTH halves.** ZMK won't deep-sleep while USB-powered
+   (`!is_usb_power_present()`), so a half cabled for logs never sleeps; patch that out and
+   lower `CONFIG_ZMK_IDLE_SLEEP_TIMEOUT` in a throwaway debug build. The central sleeps too,
+   so build both halves the same way for a faithful whole-system repro (Problem 20). Let the
+   symptom localize the fix — "keys work, only the touchpad is dead" ruled out the split and
+   pointed straight at the chip re-init.
