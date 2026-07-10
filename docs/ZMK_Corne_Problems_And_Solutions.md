@@ -1347,6 +1347,171 @@ because the chip *is* powered again a few seconds after wake; it just needed re-
 
 ---
 
+## Problem 21 — Pinch-to-zoom works in Firefox/evince but not Chrome or Qt apps (cross-application Ctrl+wheel)
+
+**Symptom (final state, after three firmware fixes below).** Two-finger pinch zooms
+correctly **in both directions** in **Firefox** and **GNOME PDF Document Viewer
+(evince)**, but:
+- **Google Chrome** (Ubuntu 22.04, **X11**, GNOME) — pinch does **nothing** at all.
+- **Master PDF Editor** (a **Qt** app) and some others — pinch **zooms *in* for BOTH
+  directions** (pinch-*out* zooms in ✓, but pinch-*in* *also* zooms in ✗).
+- **Manual `Ctrl` + real-mouse-wheel** zooms **both ways in every app**, including Chrome
+  and Master PDF Editor.
+
+**How the zoom is wired (recap).** The chip's on-chip ZOOM (pinch) gesture → the driver
+**holds mouse button 5** (`INPUT_BTN_4`) for the whole pinch **and** emits `REL_WHEEL`
+steps from the accumulated zoom delta. Host-side **input-remapper** maps button 5 →
+`Control_L` (held), so `Ctrl` + wheel = **zoom**. (See the gestures guide / README.)
+
+### Investigation — three firmware bugs, each isolated from a right-half USB log
+
+The pinch went through three distinct firmware defects before the *signal* was correct.
+Each was found by building a `-l` debug firmware that logs the zoom session and reading a
+capture while pinching:
+
+1. **Session fragmentation → Ctrl flicker.** The chip **pulses the ZOOM event bit
+   intermittently** and, mid-pinch, momentarily reports *scroll* or briefly drops a finger.
+   The first "sticky" logic still ended the zoom session on any of those, so a single
+   continuous pinch **fragmented into ~31 separate button-5 presses** (log signature: 31 ×
+   `zoom START`). Button 5 → `Ctrl` therefore flickered down/up ~31 times, so the host was
+   almost never holding `Ctrl` at the instant a wheel step landed — the driver emitted 28
+   wheel steps yet nothing zoomed.
+   **Fix:** latch the session on the first ZOOM bit and end it **only when the fingers
+   physically lift** (`num_fingers < 2`) — *not* on a cleared ZOOM bit or a momentary scroll
+   classification. Result: exactly **one** clean button-5 hold per pinch (log: balanced
+   29 × `START` / 29 × `END`, `START f=2 → … → END f=1`).
+
+2. **Diluted zoom delta → near-zero net.** The driver accumulated `RelativeX` on **every**
+   session cycle, but only ~40 % of cycles carry the ZOOM bit (`g1=0x04`); on the other
+   ~60 % (`g1=0x00`) `RelativeX` is **cursor-like movement of the tracked point, not zoom**.
+   That noise partly *cancelled* the real signal, so a full 269-cycle pinch crossed the
+   wheel threshold only **once**. (Sampled session: 22 ZOOM cycles + 30 no-gesture cycles →
+   1 wheel step.)
+   **Fix:** integrate the zoom delta **only on cycles where the raw ZOOM bit is set**;
+   button 5 / `Ctrl` still stays held for the whole pinch (that latch is independent of the
+   delta gate).
+
+3. **Divisor too high.** `zoom-div = 16` emitted ≈ 1 notch per pinch even with a clean
+   signal. Lowered to **`zoom-div = 4`** (devicetree, `eyelash_corne_right.dts`).
+
+### Proof the firmware is now correct
+
+Capture `/tmp/zoom4.log` (with `DBG zoom relx=… acc=…` per ZOOM cycle) shows that **within
+every single pinch, `RelativeX` holds one consistent sign**, and the emitted wheel steps are
+consistent same-sign notches:
+
+| Pinch (START→END) | `relx` sequence            | wheel steps    |
+| ---               | ---                        | ---            |
+| 1 (out)           | +1 +1 +1                   | +1             |
+| 2 (out)           | +4 +1 +1 +1 +1 +1 +1       | +1 +1          |
+| 3 (in)            | −3 −1 −1 −1 … (all −)       | −1 −1 −1 −1 −1  |
+| 4 (in)            | −2 −1 −1 −1 … (all −)       | −1 −1 −1        |
+| 5 (out)           | +9 +1 +1 +1 +1 +1 +1 +1    | +2 +1 +1       |
+| 6 (out)           | +1 +2 +1 +1 … (all +)      | +1 +1 +1       |
+
+`+` for pinch-out (zoom-in), `−` for pinch-in (zoom-out), 2–5 notches per pinch. The whole
+**driver → button 5 → input-remapper → `Ctrl` + wheel** pipeline is therefore **correct** —
+which is exactly why **Firefox and evince now zoom both ways**. (An overall ± histogram that
+looks balanced is just ~4 zoom-in pinches vs ~2 zoom-out pinches, not a per-pinch sign bug.)
+
+### Solution — SHIPPED: hold a real `Ctrl` in firmware (native), drop input-remapper from zoom
+
+ZMK provides exactly the needed mechanism: **`zmk,input-processor-behaviors`**, which invokes a
+normal keymap behavior when a chosen pointing code appears, running on the **central** half's
+input listener (where the keyboard HID lives) and STOPping the event so it is not also a mouse
+button. The driver *already* holds `INPUT_BTN_4` for the whole pinch, so mapping that code to
+`&kp LCTRL` presses a **genuine Left-Ctrl** (identical path to a physical key) for the whole
+gesture — **devicetree only** (`config/base.keymap`):
+
+```dts
+/ {
+    zip_zoom_ctrl: zip_zoom_ctrl {
+        compatible = "zmk,input-processor-behaviors";
+        #input-processor-cells = <0>;
+        codes = <INPUT_BTN_4>;      /* the button the driver holds during a pinch */
+        bindings = <&kp LCTRL>;     /* -> a real Left-Ctrl on the central keyboard HID */
+    };
+};
+&tps43_listener {                    /* central-side listener */
+    input-processors = <&zip_zoom_ctrl>, <&pointer_accel>, /* …existing transforms… */ ;
+};
+```
+
+The host now receives a real keyboard `Ctrl` + the classic ZMK mouse wheel — **no input-remapper
+at all** for zoom. Flash the **LEFT (central)** half (the right-half driver is unchanged) and
+`sudo systemctl stop input-remapper`.
+
+#### The crash it caused first — input-thread STACK OVERFLOW (and the fix)
+
+The very first native build **hung both halves on a pinch** (no cursor, frozen OLED). Getting the
+capture was itself a saga — see Lesson 26; the decisive trace showed:
+
+```
+ZC_IN t=1 c=260 v=1                        ← BTN_4 (pinch) pressed
+ZC_BEHAV invoke key_press pos=80 → done ret=0   ← &kp LCTRL ran to completion
+ZC_PROC[0] zip_zoom_ctrl -> ret=1 (STOP)   ← …then FAULT/reboot, with NO fault dump
+```
+
+`&kp LCTRL` **completes**, then it faults on unwind with **no dump** — the signature of a **stack
+overflow**. Zephyr's input subsystem runs `CONFIG_INPUT_MODE_THREAD`, and
+**`CONFIG_INPUT_THREAD_STACK_SIZE` defaults to 512 bytes**. Plain cursor/clicks run a shallow
+chain that fits; but invoking a keymap behaviour pushes the **entire keyboard event-dispatch
+depth** onto that 512-byte thread (input processors → invoke behaviour → raise
+`keycode_state_changed` → *every* keyboard listener: HID, HRMs, combos, caps-word, auto-mouse,
+WPM → HID report → BLE/USB send). With `CONFIG_MPU_STACK_GUARD` unset it silently corrupts memory
+instead of faulting cleanly. **Fix — one line** (`config/eyelash_corne.conf`):
+
+```
+CONFIG_INPUT_THREAD_STACK_SIZE=4096   # was 512; the input thread now invokes &kp LCTRL
+```
+
+**Confirmed:** with 4096, the pinch no longer crashes and zooms both directions in **Firefox** and
+**GNOME Document Viewer**.
+
+### Chrome + Qt still don't zoom — CONFIRMED a host wheel-classification wall (NOT firmware, NOT input-remapper)
+
+The native build was tested with **input-remapper fully removed**. Result:
+
+| App | Native `Ctrl`+wheel pinch |
+| --- | --- |
+| Firefox, GNOME Document Viewer (GTK) | ✅ both directions |
+| Google Chrome (X11) | ❌ no zoom at all |
+| Master PDF Editor (Qt) | ⚠️ zoom-out only ("smaller and smaller") |
+
+This is the **same per-app pattern as the old input-remapper path**, which **disproves** the
+earlier "input-remapper re-injects the wheel as hi-res" theory — the wall persists with no
+remapper in the loop. Since GTK apps zoom both ways with the identical events, the firmware is
+correct; the failure is **how Chromium and Qt classify/consume *this device's* wheel**:
+
+- **Chrome:** Blink hard-codes page-zoom only for non-precise (mouse-class 120-unit) `Ctrl`+scroll;
+  this device's wheel is treated as precise/touchpad-class, so `Ctrl`+wheel scrolls, never zooms.
+- **Qt (Master PDF):** its hi-res `QWheelEvent` sign handling collapses the pinch to one
+  direction regardless of gesture.
+
+Neither is fixable *through the wheel* from firmware. **Universal fix (open — pending a decision):
+bypass the wheel and send real zoom keystrokes** — a pinch emits `Ctrl`+`=` (in) / `Ctrl`+`-`
+(out), which every app honours (Chrome, Qt, GTK). Doable natively (driver emits a direction code
+per step → keymap maps to `&kp LC(EQUAL)` / `&kp LC(MINUS)`), relying on the same 4096-byte input
+stack. Trade-off: per-step (coarser) zoom vs the smooth wheel.
+
+**Build gotcha hit while shipping this.** The listener override lives in `base.keymap`, which is
+`#include`d by `config/eyelash_corne.keymap`; an **incremental build did not regenerate the
+devicetree** for a transitive-include edit (resolved `zephyr.dts` kept the *old* processor list —
+it had even silently dropped `&pointer_accel`). Always **pristine-build** (wipe the board's
+`build/` dir) after editing an `#include`d keymap/overlay fragment, and verify the change landed:
+`grep 'input-processors = <' build/*/zephyr/zephyr.dts`.
+
+**Known-good today:** native pinch-zoom (no input-remapper) works in **Firefox** and **GNOME
+document/image viewers**, both directions, no crash. Chrome + Qt need the keystroke approach above.
+
+**Files touched.** `zmk-driver-azoteq-iqs5xx/drivers/input/iqs5xx.c` (zoom session latch +
+delta-gated accumulation, debug logs stripped) and `.../eyelash_corne_right.dts` (`zoom-div = <4>`)
+— committed. `from-urob-zmk-config/config/base.keymap` (`zip_zoom_ctrl` → `&kp LCTRL`) and
+`from-urob-zmk-config/config/eyelash_corne.conf` (`CONFIG_INPUT_THREAD_STACK_SIZE=4096`) — the
+native-`Ctrl` zoom + its crash fix. The Chrome/Qt keystroke variant is not yet implemented.
+
+---
+
 ## Lessons & prevention
 
 1. **Pin, don't float.** A keyboard config that imports ZMK at `revision: main`
@@ -1459,3 +1624,39 @@ because the chip *is* powered again a few seconds after wake; it just needed re-
    so build both halves the same way for a faithful whole-system repro (Problem 20). Let the
    symptom localize the fix — "keys work, only the touchpad is dead" ruled out the split and
    pointed straight at the chip re-init.
+24. **A latched gesture must survive the sensor's own flicker.** The IQS5xx pulses the ZOOM
+   bit intermittently and briefly re-reports scroll / drops a finger *mid-pinch*; ending the
+   session on any of those fragmented one pinch into ~31 button presses and made the held
+   modifier flicker. Latch on the first gesture event and release **only on the definitive
+   end condition** (fingers lifted, `num_fingers < 2`) — never on a transient bit. And gate the
+   *delta integration* on the raw gesture bit while keeping the *modifier* held for the whole
+   session: on the no-gesture cycles the relative registers carry cursor motion, not zoom, and
+   accumulating them cancels the real signal (Problem 21).
+25. **"Correct HID events" ≠ "works in every app" — prove the firmware, then look host-side.**
+   The same clean ± Ctrl+wheel that zooms both ways in GTK apps (Firefox, evince) does nothing
+   in Chromium/X11 and mis-signs in Qt apps, while a real mouse works everywhere. Per-pinch log
+   evidence (RelativeX consistently signed) proved the firmware correct and moved the hunt to
+   host-side wheel consumption: high-resolution vs classic 120-unit wheel, and a modifier
+   injected on a *separate* virtual device than the wheel. The most robust firmware answer is to
+   stop proxying the modifier through a host remapper and emit a **real** `Ctrl` over the
+   keyboard HID (Problem 21). *Update:* the real-`Ctrl` build proved the firmware right (GTK apps
+   zoom) but Chrome/Qt **still** fail with input-remapper gone — so the wall is the desktop's
+   per-app wheel-zoom policy for this device, and the only firmware answer for those is to stop
+   using the wheel entirely (send `Ctrl`+`=`/`Ctrl`+`-` keystrokes).
+26. **USB-CDC debug logging fights a high-rate touchpad — instrument narrowly or not at all.**
+   ZMK's `CONFIG_ZMK_USB_LOGGING` forces `CONFIG_ZMK_LOG_LEVEL=4` (DBG, hard `default 4`), and the
+   split relay logs one `LOG_DBG` per input event. On a touchpad that fires ~1600 events/s the
+   flood over USB-CDC starves the `CONFIG_INPUT_MODE_THREAD` input thread — in **deferred** mode the
+   cursor stops (events pile up unprocessed); in **immediate** mode the synchronous writes hang the
+   thread outright. Both look like firmware crashes but are pure logging artifacts (chased for many
+   builds here). To actually capture a touchpad fault: set `CONFIG_ZMK_LOGGING_MINIMAL=y` (drops the
+   `default 4` back to INF, killing the DBG flood), gate your own `LOG_INF` traces to **KEY events
+   only** so cursor motion stays silent, and only then add `CONFIG_LOG_MODE_IMMEDIATE=y` so the
+   crash flushes. That combination finally caught the pinch fault cleanly (Problem 21).
+27. **Invoking a keymap behaviour from an input processor needs a real stack.** ZMK's input thread
+   defaults to a **512-byte** stack (`CONFIG_INPUT_THREAD_STACK_SIZE`), fine for mouse move/click
+   but far too small once an input-processor invokes `&kp …`, which unrolls the whole
+   keycode-event dispatch (HID, HRMs, combos, caps-word, auto-mouse, WPM, BLE/USB send) on that
+   thread. With `CONFIG_MPU_STACK_GUARD` unset the overflow corrupts memory silently and faults on
+   unwind with **no dump** — a hang, not a clean crash. Bump the stack (4096) whenever a pointing
+   input drives a behaviour (Problem 21).
