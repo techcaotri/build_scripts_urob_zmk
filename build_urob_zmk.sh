@@ -219,15 +219,20 @@ compile_firmware() {
 		force_flag="-p"
 	fi
 	echo "force_flag: $force_flag"
-	zmk_logging=""
-	if [ $3 = true ]; then
-		zmk_logging="-S zmk-usb-logging"
+	# $3 is the -l/--zmk-logging boolean. IMPORTANT: leave the global `zmk_logging`
+	# as that boolean -- the generic build path (compile_firmware_generic) checks
+	# `[ "$zmk_logging" = true ]` to add the snippet, so overwriting it here (as this
+	# used to) silently dropped USB logging on that path. Build the west snippet
+	# string in a SEPARATE var for the zmk_build.sh (urob) path's WEST_OPTS.
+	zmk_logging_opt=""
+	if [ "$3" = true ]; then
+		zmk_logging_opt="-S zmk-usb-logging"
 	fi
-	echo "zmk_logging: $zmk_logging"
+	echo "zmk_logging: $zmk_logging (snippet: ${zmk_logging_opt:-none})"
 
-  # Check if force_flag or zmk_logging is set, then add to WEST_OPTS
-  if [ -n "$force_flag" ] || [ -n "$zmk_logging" ]; then
-    WEST_OPTS="-- $force_flag $zmk_logging"
+  # Check if force_flag or the logging snippet is set, then add to WEST_OPTS
+  if [ -n "$force_flag" ] || [ -n "$zmk_logging_opt" ]; then
+    WEST_OPTS="-- $force_flag $zmk_logging_opt"
   else
     WEST_OPTS=""
   fi
@@ -250,11 +255,15 @@ compile_firmware() {
   west zephyr-export
   popd || exit
 
-	if [ -x "$CONFIG_DIR/scripts/zmk_build.sh" ]; then
+	# Test with -f (not -x) and invoke via `bash` so a checkout that lost the
+	# executable bit -- e.g. a project copied by a tool that strips file modes --
+	# still takes the urob path instead of silently falling back to the generic build
+	# (which builds differently / handled -l separately). Consistent across machines.
+	if [ -f "$CONFIG_DIR/scripts/zmk_build.sh" ]; then
 		# urob layout: delegate to the config repo's lower-level builder.
 		OPTIONS=" -l -o "$output_dir" --host-config-dir "$CONFIG_DIR" --host-zmk-dir "$ZMK_DIR" $board_opt $WEST_OPTS"
-		echo "$CONFIG_DIR"/scripts/zmk_build.sh "$OPTIONS"
-		"$CONFIG_DIR"/scripts/zmk_build.sh $OPTIONS
+		echo bash "$CONFIG_DIR"/scripts/zmk_build.sh "$OPTIONS"
+		bash "$CONFIG_DIR"/scripts/zmk_build.sh $OPTIONS
 	else
 		# Standard ZMK config without scripts/zmk_build.sh (e.g. zmk-config-rolio):
 		# build each build.yaml entry directly with west.
