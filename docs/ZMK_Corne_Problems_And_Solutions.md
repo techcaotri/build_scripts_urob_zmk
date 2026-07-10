@@ -1468,31 +1468,31 @@ CONFIG_INPUT_THREAD_STACK_SIZE=4096   # was 512; the input thread now invokes &k
 **Confirmed:** with 4096, the pinch no longer crashes and zooms both directions in **Firefox** and
 **GNOME Document Viewer**.
 
-### Chrome + Qt still don't zoom — CONFIRMED a host wheel-classification wall (NOT firmware, NOT input-remapper)
+### Chrome + Qt — RESOLVED: the wheel was on the wrong AXIS (never a host wall)
 
-The native build was tested with **input-remapper fully removed**. Result:
+The apparent "host wheel-classification wall" was a **firmware axis bug**, found from a host-side
+`libinput debug-events --show-keycodes` capture during a pinch:
 
-| App | Native `Ctrl`+wheel pinch |
-| --- | --- |
-| Firefox, GNOME Document Viewer (GTK) | ✅ both directions |
-| Google Chrome (X11) | ❌ no zoom at all |
-| Master PDF Editor (Qt) | ⚠️ zoom-out only ("smaller and smaller") |
+```
+event19  KEYBOARD_KEY          KEY_LEFTCTRL pressed                       ← native Ctrl held (correct)
+event20  POINTER_SCROLL_WHEEL  vert 0.00/0.0  horiz -15.00/-120.0 (wheel) ← classic mouse wheel… but HORIZONTAL
+```
 
-This is the **same per-app pattern as the old input-remapper path**, which **disproves** the
-earlier "input-remapper re-injects the wheel as hi-res" theory — the wall persists with no
-remapper in the loop. Since GTK apps zoom both ways with the identical events, the firmware is
-correct; the failure is **how Chromium and Qt classify/consume *this device's* wheel**:
+The pinch held a genuine keyboard `Ctrl` around a proper **classic 120-unit mouse wheel** (so
+device class / hi-res were never the problem) — but on the **horizontal** axis. **`Ctrl` +
+*horizontal* wheel is not a zoom gesture:** Chrome ignores it and Qt mis-signs it; only GTK apps
+(which zoom on either axis) worked, which is exactly what made it *look* like a Chromium/Qt policy
+wall. It also disproved the earlier input-remapper-re-injection theory (same pattern, no remapper).
 
-- **Chrome:** Blink hard-codes page-zoom only for non-precise (mouse-class 120-unit) `Ctrl`+scroll;
-  this device's wheel is treated as precise/touchpad-class, so `Ctrl`+wheel scrolls, never zooms.
-- **Qt (Master PDF):** its hi-res `QWheelEvent` sign handling collapses the pinch to one
-  direction regardless of gesture.
+Root cause: the pad is rotated 90°, so the central's `zip_scroll_transform (XY_SWAP)` un-rotates the
+scroll axes — the working *vertical scroll* is emitted as `REL_HWHEEL` and comes out vertical, but
+the zoom was emitted as `REL_WHEEL`, so the same transform sent it out **horizontal**. **Fix
+(driver, `iqs5xx.c`):** emit the zoom on `REL_HWHEEL` (matching the vertical-scroll path) so it
+reaches the host as a **vertical** wheel; negate the step for the natural pinch direction.
 
-Neither is fixable *through the wheel* from firmware. **Universal fix (open — pending a decision):
-bypass the wheel and send real zoom keystrokes** — a pinch emits `Ctrl`+`=` (in) / `Ctrl`+`-`
-(out), which every app honours (Chrome, Qt, GTK). Doable natively (driver emits a direction code
-per step → keymap maps to `&kp LC(EQUAL)` / `&kp LC(MINUS)`), relying on the same 4096-byte input
-stack. Trade-off: per-step (coarser) zoom vs the smooth wheel.
+**Confirmed working both directions in Chrome, Master PDF Editor (Qt), Firefox, and GNOME Document
+Viewer** with input-remapper stopped. The keystroke fallback is **not needed** — native
+`Ctrl`+wheel works everywhere once the axis is right.
 
 **Build gotcha hit while shipping this.** The listener override lives in `base.keymap`, which is
 `#include`d by `config/eyelash_corne.keymap`; an **incremental build did not regenerate the
@@ -1501,14 +1501,14 @@ it had even silently dropped `&pointer_accel`). Always **pristine-build** (wipe 
 `build/` dir) after editing an `#include`d keymap/overlay fragment, and verify the change landed:
 `grep 'input-processors = <' build/*/zephyr/zephyr.dts`.
 
-**Known-good today:** native pinch-zoom (no input-remapper) works in **Firefox** and **GNOME
-document/image viewers**, both directions, no crash. Chrome + Qt need the keystroke approach above.
+**Final state:** native pinch-zoom (no input-remapper) works in **Chrome, Master PDF Editor (Qt),
+Firefox, and GNOME Document Viewer** — both directions, no crash.
 
-**Files touched.** `zmk-driver-azoteq-iqs5xx/drivers/input/iqs5xx.c` (zoom session latch +
-delta-gated accumulation, debug logs stripped) and `.../eyelash_corne_right.dts` (`zoom-div = <4>`)
-— committed. `from-urob-zmk-config/config/base.keymap` (`zip_zoom_ctrl` → `&kp LCTRL`) and
-`from-urob-zmk-config/config/eyelash_corne.conf` (`CONFIG_INPUT_THREAD_STACK_SIZE=4096`) — the
-native-`Ctrl` zoom + its crash fix. The Chrome/Qt keystroke variant is not yet implemented.
+**Files touched (all committed).** `zmk-driver-azoteq-iqs5xx/drivers/input/iqs5xx.c` (zoom session
+latch + delta-gated accumulation + **emit on `REL_HWHEEL`, negated** for the correct host axis and
+direction); `.../eyelash_corne_right.dts` (`zoom-div = <4>`);
+`from-urob-zmk-config/config/base.keymap` (`zip_zoom_ctrl` → `&kp LCTRL`);
+`from-urob-zmk-config/config/eyelash_corne.conf` (`CONFIG_INPUT_THREAD_STACK_SIZE=4096`).
 
 ---
 
@@ -1639,10 +1639,13 @@ native-`Ctrl` zoom + its crash fix. The Chrome/Qt keystroke variant is not yet i
    host-side wheel consumption: high-resolution vs classic 120-unit wheel, and a modifier
    injected on a *separate* virtual device than the wheel. The most robust firmware answer is to
    stop proxying the modifier through a host remapper and emit a **real** `Ctrl` over the
-   keyboard HID (Problem 21). *Update:* the real-`Ctrl` build proved the firmware right (GTK apps
-   zoom) but Chrome/Qt **still** fail with input-remapper gone — so the wall is the desktop's
-   per-app wheel-zoom policy for this device, and the only firmware answer for those is to stop
-   using the wheel entirely (send `Ctrl`+`=`/`Ctrl`+`-` keystrokes).
+   keyboard HID (Problem 21). *Resolution:* the "host wall" was a red herring — a host-side
+   `libinput debug-events` capture showed the wheel arriving **on the horizontal axis** (`Ctrl` +
+   *horizontal* wheel isn't a zoom gesture; GTK apps zoom on either axis, so only they worked). The
+   pad is rotated 90° and the scroll transform un-rotates it, but the zoom used the un-transformed
+   axis. Emitting the zoom on `REL_HWHEEL` (so it lands vertical) fixed **all** apps — Chrome and Qt
+   included. Lesson: when "correct" events still fail per-app, **capture what the host actually
+   receives** (axis, type, values) before theorising about app policy (Problem 21).
 26. **USB-CDC debug logging fights a high-rate touchpad — instrument narrowly or not at all.**
    ZMK's `CONFIG_ZMK_USB_LOGGING` forces `CONFIG_ZMK_LOG_LEVEL=4` (DBG, hard `default 4`), and the
    split relay logs one `LOG_DBG` per input event. On a touchpad that fires ~1600 events/s the
