@@ -1512,6 +1512,130 @@ direction); `.../eyelash_corne_right.dts` (`zoom-div = <4>`);
 
 ---
 
+## Problem 22 — Two-finger "Show Activities" gesture (and why a double-tap needs a deferred right-click)
+
+**Goal, and the hard constraint that killed the obvious design.** The wanted gesture is a
+discrete "open the GNOME Activities overview" (a **Super** tap) from the touchpad. The natural
+choice — a **three-finger swipe** — is **physically impossible on this chip**: the Azoteq
+IQS5xx (TPS43) is **2-finger-max**, so its 3-finger gesture path never asserts and the old
+`three-finger-swipe` code (on `INPUT_BTN_3`) **can literally never fire**. It is now
+**disabled**, and `INPUT_BTN_3` is **repurposed** as the *Activities carrier* (see the button
+map below). The shipped replacement is a **two-finger DOUBLE-TAP → Super**, while a **single**
+two-finger tap stays the existing **right-click**.
+
+**Design (final "Option 1").** The gesture keys off the chip's on-chip **`TWO_FINGER_TAP`** bit
+(`GESTURE_EVENTS_1` bit0), which the sensor reports **mutually exclusive with SCROLL and ZOOM** —
+so a double-tap can **never** fire mid-scroll or mid-pinch. A double-tap emits a **real
+`Super`** via the same central-side `zmk,input-processor-behaviors` mechanism the zoom uses
+(Problem 21), *not* a host remapper.
+
+### The key finding — a held right-click makes GNOME ignore the Super (why "Option 2" failed)
+
+The first implementation ("Option 2") right-clicked **immediately** on *every* two-finger tap and
+merely *added* a Super pulse on the **second** tap. It **failed**: **15 / 16** double-taps opened
+nothing. A host-side `sudo libinput debug-events --show-keycodes` capture, correlated against the
+right-half driver log, showed why — the `Super` (`KEY_LEFTMETA`) **always landed *inside* a still-held
+`BTN_RIGHT`**:
+
+```
+ POINTER_BUTTON   BTN_RIGHT (0x111) pressed        ← 1st tap right-clicked immediately (Option 2)
+ KEYBOARD_KEY     KEY_LEFTMETA     pressed         ← 2nd tap's Super … but the button is still down
+ KEYBOARD_KEY     KEY_LEFTMETA     released
+ POINTER_BUTTON   BTN_RIGHT (0x111) released       ← button only lifts here → GNOME already ignored Super
+```
+
+**GNOME ignores `Super` while any pointer button is held** (the overview will not open under an
+active button press), so the overview keystroke was consumed as a no-op almost every time. The
+driver *had* emitted it (the driver log showed `BTN_3` fired) — this was a **"sent but ignored,"
+not "never sent"** bug, only visible because **both ends** were captured at once.
+
+"Option 1" fixes it by making a double-tap emit **only** `Super`, with **no mouse button held**:
+**defer** the right-click on the first tap, and **cancel** it if a second tap arrives.
+
+### Driver + central implementation
+
+**Driver — RIGHT / peripheral half** (`zmk-driver-azoteq-iqs5xx/drivers/input/iqs5xx.c`): on the
+**first** two-finger tap the driver does **not** right-click. It records `k_uptime`
+(`data->last_two_finger_tap_ms`) and schedules a **deferred** right-click on a new
+`k_work_delayable` (`data->two_finger_tap_work`) at `two-finger-double-tap-window-ms`. Two outcomes:
+
+1. **Second two-finger tap within the window →** `k_work_cancel_delayable(&two_finger_tap_work)`
+   kills the pending right-click and the driver **pulses `INPUT_BTN_3` once** (the Super carrier),
+   with **no mouse button held**. That is the double-tap.
+2. **No second tap →** the deferred work fires the **single right-click**: press `INPUT_BTN_1`,
+   auto-released ~100 ms later via the **existing** `button_release_work`.
+
+**Central — LEFT half** (`from-urob-zmk-config/config/base.keymap`): a
+`zmk,input-processor-behaviors` node **`zip_activities_super`** maps the carrier code to a **real
+Left-Super tap** and **STOPs** the event so it is never a phantom HID mouse button:
+
+```dts
+/ {
+    zip_activities_super: zip_activities_super {
+        compatible = "zmk,input-processor-behaviors";
+        #input-processor-cells = <0>;
+        codes = <INPUT_BTN_3>;      /* the Activities carrier the driver pulses on a double-tap */
+        bindings = <&kp LGUI>;      /* -> a genuine Left-Super (Activities) on the central keyboard HID */
+    };
+};
+```
+
+This runs on the input thread and invokes `&kp …`, so it needs the **same** stack bump as the zoom
+Ctrl path — `CONFIG_INPUT_THREAD_STACK_SIZE=4096` (Problem 21 / Lesson 27). **No input-remapper.**
+
+**Button map (both carriers are native keystrokes, neither reaches the host as a mouse button):**
+
+| Carrier code  | Meaning              | Central mapping (input-processor-behaviors) |
+| ---           | ---                  | ---                                         |
+| `INPUT_BTN_3` | Activities carrier   | `zip_activities_super` → `&kp LGUI`         |
+| `INPUT_BTN_4` | Zoom (pinch) carrier | `zip_zoom_ctrl` → `&kp LCTRL` (Problem 21)  |
+
+`three-finger-swipe` (formerly on `INPUT_BTN_3`) is **disabled**; its carrier is now the
+Activities gesture.
+
+### Tuning — a single knob
+
+`two-finger-double-tap-window-ms` in `boards/arm/eyelash_corne/eyelash_corne_right.dts`
+(**default `220`**). It is deliberately **one value serving two roles**: the **max interval
+between the two taps** *and* the **delay before a lone two-finger tap resolves into a right-click**.
+
+- **Lower** → snappier right-click, but you must double-tap **faster**.
+- **Higher** → easier double-tap, but a laggier right-click.
+
+Measured comfortable double-taps on this unit were **~170–215 ms**, so **~220 ms is about the
+floor** — set it much lower and real double-taps start being read as two separate right-clicks.
+Enable/disable the whole feature with the `two-finger-double-tap;` DTS boolean; the DT binding
+exposes `two-finger-double-tap-window-ms` alongside it.
+
+**Trade-off (accepted).** A **single** two-finger tap's right-click now fires **~220 ms later**,
+because it must wait out the window to be sure no second tap is coming.
+
+### Diagnosis method (worth recording)
+
+Root-caused by capturing **both ends at once**: `sudo libinput debug-events --show-keycodes` on
+the host **plus** a right-half driver USB log, and correlating "**driver fired + emitted `BTN_3`**"
+against "**host got `KEY_LEFTMETA` but inside a held `BTN_RIGHT`**." That pairing is what
+distinguished *sent-but-ignored* from *never-sent* and pointed straight at the held-button
+suppression. The **220 ms** window itself was set from **real data** — a throwaway driver build
+that logged the **inter-tap interval on every two-finger tap** measured **~125–217 ms**.
+
+**Confirmation.** With Option 1 (deferred, cancel-on-double-tap): a two-finger **double-tap
+reliably opens Activities** (emits **only** `Super`, no held button), and a **single** two-finger
+tap still right-clicks (just ~220 ms later). Native `Super` over the keyboard HID — **no
+input-remapper**.
+
+**Files touched (all committed).**
+`zmk-driver-azoteq-iqs5xx/drivers/input/iqs5xx.c` (deferred right-click via
+`two_finger_tap_work` + `last_two_finger_tap_ms`; double-tap cancels it and pulses `INPUT_BTN_3`;
+three-finger-swipe disabled);
+`boards/arm/eyelash_corne/eyelash_corne_right.dts` (`two-finger-double-tap;` +
+`two-finger-double-tap-window-ms = <220>`) and its DT binding;
+`from-urob-zmk-config/config/base.keymap` (`zip_activities_super` → `&kp LGUI`);
+`from-urob-zmk-config/config/eyelash_corne.conf` (`CONFIG_INPUT_THREAD_STACK_SIZE=4096`, shared
+with the zoom path).
+
+---
+
 ## Lessons & prevention
 
 1. **Pin, don't float.** A keyboard config that imports ZMK at `revision: main`
@@ -1663,3 +1787,17 @@ direction); `.../eyelash_corne_right.dts` (`zoom-div = <4>`);
    thread. With `CONFIG_MPU_STACK_GUARD` unset the overflow corrupts memory silently and faults on
    unwind with **no dump** — a hang, not a clean crash. Bump the stack (4096) whenever a pointing
    input drives a behaviour (Problem 21).
+28. **A held pointer button suppresses a compositor `Super`/overview — so a discrete gesture that
+   *also* clicks must defer or suppress the click.** GNOME will not open the Activities overview
+   (`Super`) while any pointer button is down, so a design that right-clicked on every two-finger
+   tap and merely added `Super` on the second landed the keystroke **inside** a held `BTN_RIGHT`
+   and it was ignored (15/16 double-taps did nothing). The fix is to make the discrete action emit
+   **only** its keystroke with **no button held**: **defer** the click (delayable work) and
+   **cancel** it when the second tap arrives; a lone tap still clicks once the window lapses
+   (Problem 22).
+29. **Capture BOTH ends — driver log *and* `libinput debug-events` — to tell "not sent" from "sent
+   but ignored."** The whole Option-2 failure looked like a dropped event, but a right-half driver
+   log ("emitted `BTN_3`") paired with a host `libinput debug-events --show-keycodes` capture
+   ("`KEY_LEFTMETA` arrived, but inside a held `BTN_RIGHT`") proved the firmware was correct and the
+   *host* was discarding it. One-sided evidence would have sent the hunt back into the driver; the
+   two-sided capture named the real cause (a held-button suppression) at once (Problem 22).
